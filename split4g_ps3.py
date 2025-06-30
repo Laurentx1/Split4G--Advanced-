@@ -7,815 +7,1300 @@ import time
 import logging
 from datetime import timedelta
 import threading
+import queue
 import hashlib
+import re
 import json
+import psutil
+from typing import Optional, List, Dict, Tuple
+import tempfile
 
-# ===== CONFIGURAÇÕES GLOBAIS =====
-LIMITE_FAT32 = 4 * 1024**3 - 100 * 1024**2  # 3.9GB (margem maior de segurança)
-LOG_FILE = "split4g_ps3.log"
-TAMANHO_BUFFER = 1024 * 1024 * 64  # 64MB (melhor performance)
-CONFIG_FILE = "split4g_config.json"
+# ===== CONSTANTS =====
+FAT32_LIMIT = 4 * 1024**3 - 1  # 4GB - 1 byte
+MIN_BUFFER_SIZE = 1024 * 1024  # 1MB minimum
+MAX_BUFFER_SIZE = 128 * 1024 * 1024  # 128MB maximum
+PS3_SPLIT_EXT = ".66600"  # Standard PS3 split extension
+LOG_FILE = "ps3_game_copier.log"
+RESUME_FILE = "ps3_copy_resume.json"
+CONFIG_FILE = "ps3_copier_config.json"
 
-# ===== CONFIGURAÇÃO DO LOG =====
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s: %(message)s',
-    datefmt='%d/%m/%Y %H:%M:%S',
-    encoding='utf-8'
-)
+# PS3 file validation
+REQUIRED_PS3_FILES = ['PS3_DISC.SFB', 'PARAM.SFO', 'ICON0.PNG']
+PS3_FILE_SIGNATURES = {
+    'PARAM.SFO': b'\x00PSF',
+    'PS3_DISC.SFB': b'PS3D',
+    'EBOOT.BIN': b'\x7FELF'
+}
 
-class Split4GApp:
+# FAT32 reserved names
+FAT32_RESERVED_NAMES = {
+    'CON', 'PRN', 'AUX', 'NUL', 'COM1', 'COM2', 'COM3', 'COM4', 'COM5',
+    'COM6', 'COM7', 'COM8', 'COM9', 'LPT1', 'LPT2', 'LPT3', 'LPT4',
+    'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'
+}
+
+class PS3GameCopier:
     def __init__(self, root):
         self.root = root
-        self.root.title("Split4G PS3 - Copiador de Jogos v6.0 Enhanced")
-        self.root.geometry("700x550")
-        self.root.resizable(True, False)
+        self.setup_logging()
+        self.load_config()
+        self.setup_ui()
+        self.setup_vars()
         
-        # Configuração de estilo
-        self.style = ttk.Style()
-        self.style.theme_use('clam')
-        self.style.configure('TButton', font=('Segoe UI', 10))
-        self.style.configure('TLabel', font=('Segoe UI', 9))
-        self.style.configure('red.TButton', foreground='red', font=('Segoe UI', 10, 'bold'))
-        self.style.configure('green.TButton', foreground='green', font=('Segoe UI', 10, 'bold'))
-        
-        # Variáveis de controle
-        self.origem = Path(".")
-        self.destino = Path(".")
-        self.copiar_ativo = False
-        self.cancelar_copia = False
-        self.pausar_copia = False
-        self.estatisticas = {
-            'arquivos_copiados': 0,
-            'bytes_copiados': 0,
-            'arquivos_divididos': 0,
-            'tempo_inicio': 0
+        # Thread management
+        self.gui_queue = queue.Queue()
+        self.root.after(100, self.process_gui_queue)
+
+    def setup_logging(self):
+        """Setup comprehensive logging"""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(LOG_FILE, encoding='utf-8'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+
+    def load_config(self):
+        """Load configuration from file"""
+        self.config = {
+            'buffer_size': self.calculate_optimal_buffer_size(),
+            'max_retries': 3,
+            'retry_delay': 2,
+            'verify_signatures': True,
+            'create_backup': False,
+            'show_advanced': False
         }
         
-        # Carrega configurações salvas
-        self.carregar_config()
-        
-        # Interface
-        self.criar_interface()
-        
-        # Protocolo de fechamento
-        self.root.protocol("WM_DELETE_WINDOW", self.ao_fechar)
-    
-    def carregar_config(self):
-        """Carrega configurações salvas"""
         try:
             if Path(CONFIG_FILE).exists():
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-                    self.origem = Path(config.get('origem', '.'))
-                    self.destino = Path(config.get('destino', '.'))
+                with open(CONFIG_FILE, 'r') as f:
+                    saved_config = json.load(f)
+                    self.config.update(saved_config)
         except Exception as e:
-            logging.warning(f"Erro ao carregar configurações: {e}")
-    
-    def salvar_config(self):
-        """Salva configurações atuais"""
+            self.logger.warning(f"Could not load config: {e}")
+
+    def save_config(self):
+        """Save configuration to file"""
         try:
-            config = {
-                'origem': str(self.origem),
-                'destino': str(self.destino)
-            }
-            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump(config, f, indent=2, ensure_ascii=False)
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump(self.config, f, indent=2)
         except Exception as e:
-            logging.warning(f"Erro ao salvar configurações: {e}")
-    
-    def criar_interface(self):
-        # Frame principal com scrollbar
-        main_frame = ttk.Frame(self.root, padding=15)
+            self.logger.warning(f"Could not save config: {e}")
+
+    def calculate_optimal_buffer_size(self) -> int:
+        """Calculate optimal buffer size based on available memory"""
+        try:
+            available_memory = psutil.virtual_memory().available
+            # Use 1% of available memory, clamped to min/max
+            optimal_size = max(MIN_BUFFER_SIZE, min(MAX_BUFFER_SIZE, available_memory // 100))
+            return optimal_size
+        except:
+            return 32 * 1024 * 1024  # 32MB fallback
+
+    def setup_vars(self):
+        self.source = Path(".")
+        self.dest = Path(".")
+        self.is_running = False
+        self.should_cancel = False
+        self.resume_data = {}
+        self.duplicate_games = {}
+        self.stats = {
+            'total_files': 0,
+            'total_size': 0,
+            'copied': 0,
+            'split': 0,
+            'skipped': 0,
+            'failed': 0,
+            'bytes_copied': 0,
+            'start_time': 0,
+            'current_file': "",
+            'retry_count': 0
+        }
+
+    def setup_ui(self):
+        self.root.title("PS3 Game Copier - Enhanced Edition")
+        self.root.geometry("850x700")
+        
+        # Create notebook for tabs
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Main tab
+        self.main_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.main_frame, text="Main")
+        self.setup_main_tab()
+        
+        # Advanced tab
+        self.advanced_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.advanced_frame, text="Advanced")
+        self.setup_advanced_tab()
+        
+        # Log tab
+        self.log_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.log_frame, text="Log")
+        self.setup_log_tab()
+
+    def setup_main_tab(self):
+        main_frame = ttk.Frame(self.main_frame, padding=20)
         main_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Título melhorado
-        titulo_frame = ttk.Frame(main_frame)
-        titulo_frame.grid(row=0, column=0, columnspan=3, pady=(0, 15), sticky="ew")
+        # Source selection
+        ttk.Label(main_frame, text="Source Folder with PS3 Games:").pack(anchor="w")
+        self.source_entry = ttk.Entry(main_frame, width=80)
+        self.source_entry.pack(fill=tk.X, pady=5)
         
-        ttk.Label(
-            titulo_frame,
-            text="🎮 SPLIT4G PS3 - COPIADOR DE JOGOS ENHANCED",
-            font=("Segoe UI", 16, "bold"),
-            foreground="#2c3e50"
-        ).pack()
+        src_btn_frame = ttk.Frame(main_frame)
+        src_btn_frame.pack(fill=tk.X)
+        ttk.Button(src_btn_frame, text="Browse", command=self.browse_source).pack(side="right")
+        ttk.Button(src_btn_frame, text="Scan Games", command=self.scan_games_preview).pack(side="right", padx=(0,5))
         
-        ttk.Label(
-            titulo_frame,
-            text="Copia jogos PS3 para FAT32 com divisão automática de arquivos >3.9GB",
-            font=("Segoe UI", 10),
-            foreground="#7f8c8d"
-        ).pack()
+        # Destination selection
+        ttk.Label(main_frame, text="FAT32 Destination (GAMES folder):").pack(anchor="w", pady=(10,0))
+        self.dest_entry = ttk.Entry(main_frame, width=80)
+        self.dest_entry.pack(fill=tk.X, pady=5)
+        ttk.Button(main_frame, text="Browse", command=self.browse_dest).pack(anchor="e")
         
-        # Frame de configurações aprimorado
-        config_frame = ttk.LabelFrame(main_frame, text=" 📁 Configurações de Pasta ", padding=15)
-        config_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=10)
+        # Options
+        options_frame = ttk.LabelFrame(main_frame, text="Options", padding=10)
+        options_frame.pack(fill=tk.X, pady=10)
         
-        # Origem
-        ttk.Label(config_frame, text="Pasta de Origem (Jogos PS3):").grid(row=0, column=0, sticky="w", pady=5)
-        self.origem_entry = ttk.Entry(config_frame, width=60)
-        self.origem_entry.grid(row=0, column=1, padx=10, sticky="ew")
-        self.origem_entry.insert(0, str(self.origem))
-        ttk.Button(
-            config_frame,
-            text="📂 Procurar",
-            command=self.selecionar_origem,
-            width=12
-        ).grid(row=0, column=2, padx=5)
+        # First row of options
+        opt_row1 = ttk.Frame(options_frame)
+        opt_row1.pack(fill=tk.X)
         
-        # Destino
-        ttk.Label(config_frame, text="Pasta de Destino (FAT32):").grid(row=1, column=0, sticky="w", pady=5)
-        self.destino_entry = ttk.Entry(config_frame, width=60)
-        self.destino_entry.grid(row=1, column=1, padx=10, sticky="ew")
-        self.destino_entry.insert(0, str(self.destino))
-        ttk.Button(
-            config_frame,
-            text="📂 Procurar",
-            command=self.selecionar_destino,
-            width=12
-        ).grid(row=1, column=2, padx=5)
+        self.split_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_row1, text="Auto-split files >4GB", variable=self.split_var).pack(side="left", padx=5)
         
-        config_frame.columnconfigure(1, weight=1)
+        self.verify_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_row1, text="Verify copied files", variable=self.verify_var).pack(side="left", padx=5)
         
-        # Opções avançadas
-        options_frame = ttk.LabelFrame(main_frame, text=" ⚙️ Opções Avançadas ", padding=10)
-        options_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=10)
+        self.dry_run_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opt_row1, text="Dry run (preview only)", variable=self.dry_run_var).pack(side="left", padx=5)
         
-        options_row1 = ttk.Frame(options_frame)
-        options_row1.pack(fill="x", pady=5)
+        # Second row of options
+        opt_row2 = ttk.Frame(options_frame)
+        opt_row2.pack(fill=tk.X, pady=(5,0))
         
-        self.divisao_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            options_row1,
-            text="🔄 Dividir arquivos >3.9GB (FAT32)",
-            variable=self.divisao_var
-        ).pack(side="left", padx=10)
+        self.skip_duplicates_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_row2, text="Skip duplicates", variable=self.skip_duplicates_var).pack(side="left", padx=5)
         
-        self.sobrescrever_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            options_row1,
-            text="🔄 Sobrescrever arquivos existentes",
-            variable=self.sobrescrever_var
-        ).pack(side="left", padx=10)
+        self.resume_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_row2, text="Resume interrupted copies", variable=self.resume_var).pack(side="left", padx=5)
         
-        options_row2 = ttk.Frame(options_frame)
-        options_row2.pack(fill="x", pady=5)
+        # Game list preview
+        preview_frame = ttk.LabelFrame(main_frame, text="Games Found", padding=5)
+        preview_frame.pack(fill=tk.BOTH, expand=True, pady=10)
         
-        self.verificar_integridade_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            options_row2,
-            text="✅ Verificar integridade dos arquivos",
-            variable=self.verificar_integridade_var
-        ).pack(side="left", padx=10)
+        # Create treeview for game list
+        columns = ('Name', 'Size', 'Type', 'Status')
+        self.game_tree = ttk.Treeview(preview_frame, columns=columns, show='headings', height=8)
         
-        self.criar_backup_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            options_row2,
-            text="💾 Criar backup antes de sobrescrever",
-            variable=self.criar_backup_var
-        ).pack(side="left", padx=10)
+        for col in columns:
+            self.game_tree.heading(col, text=col)
+            self.game_tree.column(col, width=150)
         
-        # Controles melhorados
+        # Scrollbars for treeview
+        tree_scroll_y = ttk.Scrollbar(preview_frame, orient=tk.VERTICAL, command=self.game_tree.yview)
+        tree_scroll_x = ttk.Scrollbar(preview_frame, orient=tk.HORIZONTAL, command=self.game_tree.xview)
+        self.game_tree.configure(yscrollcommand=tree_scroll_y.set, xscrollcommand=tree_scroll_x.set)
+        
+        self.game_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+        tree_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        # Progress section
+        progress_frame = ttk.LabelFrame(main_frame, text="Progress", padding=10)
+        progress_frame.pack(fill=tk.X, pady=10)
+        
+        self.progress = ttk.Progressbar(progress_frame, orient=tk.HORIZONTAL, mode='determinate')
+        self.progress.pack(fill=tk.X, pady=(0,5))
+        
+        self.file_var = tk.StringVar(value="Ready to copy PS3 games...")
+        ttk.Label(progress_frame, textvariable=self.file_var, wraplength=700).pack(anchor="w")
+        
+        self.status_var = tk.StringVar(value="Status: Waiting")
+        ttk.Label(progress_frame, textvariable=self.status_var).pack(anchor="w", pady=(5,0))
+        
+        # Buttons
         btn_frame = ttk.Frame(main_frame)
-        btn_frame.grid(row=3, column=0, columnspan=3, pady=20)
+        btn_frame.pack(fill=tk.X, pady=10)
         
-        self.btn_iniciar = ttk.Button(
-            btn_frame,
-            text="🚀 INICIAR CÓPIA",
-            command=self.iniciar_copia,
-            style="green.TButton",
-            width=18
-        )
-        self.btn_iniciar.pack(side="left", padx=8)
+        self.start_btn = ttk.Button(btn_frame, text="Start Copy", command=self.start_copy)
+        self.start_btn.pack(side="left", padx=5)
         
-        self.btn_pausar = ttk.Button(
-            btn_frame,
-            text="⏸️ PAUSAR",
-            command=self.pausar_retomar_copia,
-            width=18,
-            state=tk.DISABLED
-        )
-        self.btn_pausar.pack(side="left", padx=8)
+        self.cancel_btn = ttk.Button(btn_frame, text="Cancel", command=self.cancel_copy, state=tk.DISABLED)
+        self.cancel_btn.pack(side="left", padx=5)
         
-        self.btn_cancelar = ttk.Button(
-            btn_frame,
-            text="❌ CANCELAR",
-            command=self.cancelar_copia_func,
-            style="red.TButton",
-            width=18,
-            state=tk.DISABLED
-        )
-        self.btn_cancelar.pack(side="left", padx=8)
+        ttk.Button(btn_frame, text="Clear Log", command=self.clear_log).pack(side="right", padx=5)
+
+    def setup_advanced_tab(self):
+        adv_frame = ttk.Frame(self.advanced_frame, padding=20)
+        adv_frame.pack(fill=tk.BOTH, expand=True)
         
-        ttk.Button(
-            btn_frame,
-            text="📄 VER LOG",
-            command=self.ver_log,
-            width=18
-        ).pack(side="left", padx=8)
+        # Buffer size setting
+        buffer_frame = ttk.LabelFrame(adv_frame, text="Performance Settings", padding=10)
+        buffer_frame.pack(fill=tk.X, pady=5)
         
-        # Progresso detalhado
-        progress_frame = ttk.LabelFrame(main_frame, text=" 📊 Progresso da Cópia ", padding=15)
-        progress_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=10)
+        ttk.Label(buffer_frame, text="Buffer Size (MB):").pack(side="left")
+        self.buffer_var = tk.IntVar(value=self.config['buffer_size'] // (1024*1024))
+        buffer_spin = ttk.Spinbox(buffer_frame, from_=1, to=128, textvariable=self.buffer_var, width=10)
+        buffer_spin.pack(side="left", padx=5)
         
-        # Barra de progresso principal
-        self.progresso = ttk.Progressbar(
-            progress_frame,
-            orient=tk.HORIZONTAL,
-            length=650,
-            mode='determinate'
-        )
-        self.progresso.pack(fill=tk.X, pady=5)
+        # Retry settings
+        retry_frame = ttk.LabelFrame(adv_frame, text="Error Handling", padding=10)
+        retry_frame.pack(fill=tk.X, pady=5)
         
-        # Status principal
-        self.status_var = tk.StringVar()
-        self.status_var.set("🟢 Pronto para iniciar a cópia.")
-        status_label = ttk.Label(
-            progress_frame,
-            textvariable=self.status_var,
-            wraplength=650,
-            anchor="w",
-            font=("Segoe UI", 10, "bold")
-        )
-        status_label.pack(fill=tk.X, pady=5)
+        ttk.Label(retry_frame, text="Max Retries:").pack(side="left")
+        self.retry_var = tk.IntVar(value=self.config['max_retries'])
+        retry_spin = ttk.Spinbox(retry_frame, from_=0, to=10, textvariable=self.retry_var, width=10)
+        retry_spin.pack(side="left", padx=5)
         
-        # Detalhes
-        self.detalhes_var = tk.StringVar()
-        self.detalhes_var.set("")
-        ttk.Label(
-            progress_frame,
-            textvariable=self.detalhes_var,
-            wraplength=650,
-            anchor="w",
-            foreground="#555555"
-        ).pack(fill=tk.X, pady=2)
+        ttk.Label(retry_frame, text="Retry Delay (seconds):").pack(side="left", padx=(20,0))
+        self.retry_delay_var = tk.IntVar(value=self.config['retry_delay'])
+        delay_spin = ttk.Spinbox(retry_frame, from_=1, to=30, textvariable=self.retry_delay_var, width=10)
+        delay_spin.pack(side="left", padx=5)
         
-        # Estatísticas em tempo real
-        stats_frame = ttk.Frame(progress_frame)
-        stats_frame.pack(fill="x", pady=10)
+        # Validation settings
+        validation_frame = ttk.LabelFrame(adv_frame, text="Validation Settings", padding=10)
+        validation_frame.pack(fill=tk.X, pady=5)
         
-        self.stats_var = tk.StringVar()
-        self.stats_var.set("Estatísticas: Aguardando início...")
-        ttk.Label(
-            stats_frame,
-            textvariable=self.stats_var,
-            foreground="#2c3e50",
-            font=("Segoe UI", 9)
-        ).pack(fill="x")
+        self.signature_var = tk.BooleanVar(value=self.config['verify_signatures'])
+        ttk.Checkbutton(validation_frame, text="Verify PS3 file signatures", variable=self.signature_var).pack(anchor="w")
         
-        # Configurar redimensionamento
-        main_frame.columnconfigure(0, weight=1)
-    
-    def selecionar_origem(self):
-        pasta = filedialog.askdirectory(
-            title="Selecione a pasta com os jogos PS3",
-            initialdir=str(self.origem)
-        )
-        if pasta:
-            self.origem = Path(pasta)
-            self.origem_entry.delete(0, tk.END)
-            self.origem_entry.insert(0, pasta)
-            self.salvar_config()
-    
-    def selecionar_destino(self):
-        pasta = filedialog.askdirectory(
-            title="Selecione a pasta de destino (FAT32)",
-            initialdir=str(self.destino)
-        )
-        if pasta:
-            self.destino = Path(pasta)
-            self.destino_entry.delete(0, tk.END)
-            self.destino_entry.insert(0, pasta)
-            self.salvar_config()
-    
-    def ver_log(self):
-        try:
-            if Path(LOG_FILE).exists():
-                os.startfile(LOG_FILE)
-            else:
-                messagebox.showinfo("Log", "Nenhum arquivo de log encontrado ainda.")
-        except Exception as e:
-            messagebox.showerror("Erro", f"Não foi possível abrir o log:\n{e}")
-    
-    def formatar_tamanho(self, bytes_):
-        """Formata tamanho em bytes para formato legível"""
-        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-            if bytes_ < 1024.0:
-                return f"{bytes_:.2f} {unit}"
-            bytes_ /= 1024.0
-        return f"{bytes_:.2f} PB"
-    
-    def calcular_checksum(self, arquivo_path, algoritmo='md5'):
-        """Calcula checksum para verificação de integridade"""
-        hash_func = hashlib.md5() if algoritmo == 'md5' else hashlib.sha256()
-        try:
-            with open(arquivo_path, 'rb') as f:
-                while chunk := f.read(TAMANHO_BUFFER):
-                    hash_func.update(chunk)
-            return hash_func.hexdigest()
-        except Exception as e:
-            logging.error(f"Erro ao calcular checksum de {arquivo_path}: {e}")
-            return None
-    
-    def verificar_espaco_disco(self, tamanho_necessario):
-        """Verifica se há espaço suficiente no destino"""
-        try:
-            espaco_livre = shutil.disk_usage(self.destino).free
-            return espaco_livre >= tamanho_necessario, espaco_livre
-        except Exception as e:
-            logging.error(f"Erro ao verificar espaço em disco: {e}")
-            return False, 0
-    
-    def dividir_arquivo_otimizado(self, origem, destino_base):
-        """Versão otimizada da divisão de arquivos com verificações"""
-        try:
-            tamanho_origem = origem.stat().st_size
-            
-            # Se arquivo é pequeno ou divisão está desabilitada
-            if tamanho_origem <= LIMITE_FAT32 and self.divisao_var.get():
-                return self.copiar_arquivo_simples(origem, destino_base)
-            
-            # Divisão de arquivo grande
-            return self.dividir_arquivo_grande(origem, destino_base, tamanho_origem)
-            
-        except Exception as e:
-            logging.error(f"ERRO ao processar {origem.name}: {e}")
-            return [], 0
-    
-    def copiar_arquivo_simples(self, origem, destino):
-        """Copia arquivo simples com verificação de integridade"""
-        try:
-            tamanho = origem.stat().st_size
-            
-            # Verifica se já existe e está completo
-            if not self.sobrescrever_var.get() and destino.exists():
-                if destino.stat().st_size == tamanho:
-                    if self.verificar_integridade_var.get():
-                        # Verificação rápida por tamanho e data
-                        if destino.stat().st_mtime >= origem.stat().st_mtime:
-                            logging.info(f"Arquivo já existe e está atualizado: {destino.name}")
-                            return [destino], tamanho
-                    else:
-                        return [destino], tamanho
-            
-            # Cria backup se necessário
-            if self.criar_backup_var.get() and destino.exists():
-                backup_path = destino.with_suffix(f'.backup_{int(time.time())}')
-                shutil.copy2(destino, backup_path)
-                logging.info(f"Backup criado: {backup_path.name}")
-            
-            # Cópia com arquivo temporário
-            temp_path = destino.with_suffix('.tmp')
-            try:
-                with open(origem, 'rb') as src, open(temp_path, 'wb') as dst:
-                    bytes_copiados = 0
-                    while chunk := src.read(TAMANHO_BUFFER):
-                        if self.cancelar_copia:
-                            raise InterruptedError("Operação cancelada")
-                        
-                        while self.pausar_copia:
-                            time.sleep(0.1)
-                            if self.cancelar_copia:
-                                raise InterruptedError("Operação cancelada")
-                        
-                        dst.write(chunk)
-                        bytes_copiados += len(chunk)
-                
-                # Verificação de integridade
-                if temp_path.stat().st_size == tamanho:
-                    temp_path.replace(destino)
-                    logging.info(f"Arquivo copiado: {destino.name} ({self.formatar_tamanho(tamanho)})")
-                    return [destino], tamanho
-                else:
-                    raise ValueError("Tamanho do arquivo copiado não confere")
-                    
-            except Exception as e:
-                if temp_path.exists():
-                    temp_path.unlink()
-                raise e
-                
-        except Exception as e:
-            logging.error(f"Erro ao copiar {origem.name}: {e}")
-            return [], 0
-    
-    def dividir_arquivo_grande(self, origem, destino_base, tamanho_total):
-        """Divide arquivos grandes em partes"""
-        partes = []
-        bytes_totais = 0
-        parte_num = 0
+        self.backup_var = tk.BooleanVar(value=self.config['create_backup'])
+        ttk.Checkbutton(validation_frame, text="Create backup of existing files", variable=self.backup_var).pack(anchor="w")
         
-        try:
-            with open(origem, 'rb') as f_origem:
-                while bytes_totais < tamanho_total:
-                    if self.cancelar_copia:
-                        raise InterruptedError("Operação cancelada")
-                    
-                    parte_num += 1
-                    # Formato .66600, .66601, etc.
-                    parte_nome = destino_base.parent / f"{destino_base.name}.666{parte_num:02d}"
-                    temp_parte = parte_nome.with_suffix('.tmp')
-                    
-                    try:
-                        with open(temp_parte, 'wb') as f_parte:
-                            bytes_parte = 0
-                            while bytes_parte < LIMITE_FAT32 and bytes_totais < tamanho_total:
-                                while self.pausar_copia:
-                                    time.sleep(0.1)
-                                    if self.cancelar_copia:
-                                        raise InterruptedError("Operação cancelada")
-                                
-                                chunk_size = min(TAMANHO_BUFFER, LIMITE_FAT32 - bytes_parte, tamanho_total - bytes_totais)
-                                chunk = f_origem.read(chunk_size)
-                                
-                                if not chunk:
-                                    break
-                                
-                                f_parte.write(chunk)
-                                bytes_parte += len(chunk)
-                                bytes_totais += len(chunk)
-                        
-                        # Verificação da parte
-                        if temp_parte.stat().st_size > 0:
-                            temp_parte.replace(parte_nome)
-                            partes.append(parte_nome)
-                            self.estatisticas['arquivos_divididos'] += 1
-                    
-                    except Exception:
-                        if temp_parte.exists():
-                            temp_parte.unlink()
-                        raise
-            
-            logging.info(f"Arquivo dividido em {len(partes)} partes: {origem.name}")
-            return partes, bytes_totais
-            
-        except Exception as e:
-            logging.error(f"Erro ao dividir {origem.name}: {e}")
-            # Limpeza das partes criadas
-            for parte in partes:
-                if parte.exists():
-                    try:
-                        parte.unlink()
-                    except:
-                        pass
-            return [], 0
-    
-    def copiar_jogo_completo(self, pasta_jogo, destino_base, progresso_info):
-        """Copia um jogo completo com todas as verificações"""
-        total_copiado = 0
-        arquivos_processados = 0
+        # Save/Load settings
+        settings_frame = ttk.Frame(adv_frame)
+        settings_frame.pack(fill=tk.X, pady=20)
         
-        try:
-            # Cria estrutura de pastas
-            os.makedirs(destino_base, exist_ok=True)
-            
-            # Lista todos os arquivos
-            todos_arquivos = []
-            for root, _, files in os.walk(pasta_jogo):
-                for file in files:
-                    arquivo_path = Path(root) / file
-                    todos_arquivos.append(arquivo_path)
-            
-            total_arquivos = len(todos_arquivos)
-            logging.info(f"Iniciando cópia de {pasta_jogo.name}: {total_arquivos} arquivos")
-            
-            # Processa cada arquivo
-            for idx, arquivo in enumerate(todos_arquivos, 1):
-                if self.cancelar_copia:
-                    break
-                
-                # Calcula caminho relativo
-                rel_path = arquivo.relative_to(pasta_jogo)
-                destino_arquivo = destino_base / rel_path
-                
-                # Atualiza interface
-                self.status_var.set(f"🎮 {pasta_jogo.name}: {rel_path}")
-                self.detalhes_var.set(
-                    f"Arquivo {idx}/{total_arquivos} • "
-                    f"Tamanho: {self.formatar_tamanho(arquivo.stat().st_size)}"
-                )
-                self.atualizar_interface()
-                
-                # Cria pasta pai se necessário
-                os.makedirs(destino_arquivo.parent, exist_ok=True)
-                
-                # Processa arquivo
-                partes, bytes_copiados = self.dividir_arquivo_otimizado(arquivo, destino_arquivo)
-                
-                if partes:
-                    total_copiado += bytes_copiados
-                    arquivos_processados += len(partes)
-                    progresso_info['copiado'] += bytes_copiados
-                    self.progresso["value"] = progresso_info['copiado']
-                    
-                    # Atualiza estatísticas
-                    self.estatisticas['arquivos_copiados'] += len(partes)
-                    self.estatisticas['bytes_copiados'] += bytes_copiados
-                
-                # Atualiza estatísticas na interface
-                self.atualizar_estatisticas(progresso_info)
-            
-            logging.info(f"Jogo concluído: {pasta_jogo.name} - {self.formatar_tamanho(total_copiado)}")
-            return total_copiado, arquivos_processados
-            
-        except Exception as e:
-            logging.error(f"Erro ao copiar jogo {pasta_jogo.name}: {e}")
-            return 0, 0
-    
-    def atualizar_estatisticas(self, progresso_info):
-        """Atualiza estatísticas em tempo real"""
-        tempo_decorrido = time.time() - self.estatisticas['tempo_inicio']
-        if tempo_decorrido > 0:
-            velocidade = progresso_info['copiado'] / tempo_decorrido
-            progresso_pct = (progresso_info['copiado'] / progresso_info['total_geral']) * 100
-            tempo_restante = (progresso_info['total_geral'] - progresso_info['copiado']) / velocidade if velocidade > 0 else 0
-            
-            self.stats_var.set(
-                f"📊 Arquivos: {self.estatisticas['arquivos_copiados']} • "
-                f"Arquivos divididos: {self.estatisticas['arquivos_divididos']} • "
-                f"Progresso: {progresso_pct:.1f}% • "
-                f"Velocidade: {self.formatar_tamanho(velocidade)}/s • "
-                f"Restante: {timedelta(seconds=int(tempo_restante))}"
-            )
-    
-    def processo_copia_principal(self):
-        """Processo principal de cópia com melhorias"""
-        try:
-            self.copiar_ativo = True
-            self.cancelar_copia = False
-            self.pausar_copia = False
-            self.estatisticas['tempo_inicio'] = time.time()
-            
-            # Reset estatísticas
-            self.estatisticas.update({
-                'arquivos_copiados': 0,
-                'bytes_copiados': 0,
-                'arquivos_divididos': 0
-            })
-            
-            # Análise inicial
-            self.status_var.set("🔍 Analisando jogos...")
-            self.detalhes_var.set("Verificando estrutura de pastas...")
-            self.atualizar_interface()
-            
-            # Validações básicas
-            if not self.origem.exists():
-                raise FileNotFoundError("Pasta de origem não encontrada!")
-            
-            if not self.destino.exists():
-                raise FileNotFoundError("Pasta de destino não encontrada!")
-            
-            # Lista jogos (pastas)
-            jogos = [p for p in self.origem.iterdir() if p.is_dir()]
-            if not jogos:
-                raise ValueError("Nenhuma pasta de jogo encontrada!")
-            
-            logging.info(f"Encontrados {len(jogos)} jogos para cópia")
-            
-            # Calcula tamanho total
-            tamanho_total = 0
-            self.status_var.set("📏 Calculando tamanho total...")
-            for jogo in jogos:
-                for root, _, files in os.walk(jogo):
-                    for file in files:
-                        tamanho_total += (Path(root) / file).stat().st_size
-                self.detalhes_var.set(f"Analisando: {jogo.name}")
-                self.atualizar_interface()
-            
-            # Verifica espaço
-            tem_espaco, espaco_livre = self.verificar_espaco_disco(tamanho_total)
-            if not tem_espaco:
-                raise ValueError(
-                    f"Espaço insuficiente!\n"
-                    f"Necessário: {self.formatar_tamanho(tamanho_total)}\n"
-                    f"Disponível: {self.formatar_tamanho(espaco_livre)}"
-                )
-            
-            # Configuração do progresso
-            self.progresso["maximum"] = tamanho_total
-            self.progresso["value"] = 0
-            
-            progresso_info = {
-                'total_geral': tamanho_total,
-                'copiado': 0
-            }
-            
-            # Cópia dos jogos
-            jogos_copiados = 0
-            for idx, jogo in enumerate(jogos, 1):
-                if self.cancelar_copia:
-                    break
-                
-                self.status_var.set(
-                    f"🎮 [{idx}/{len(jogos)}] Copiando: {jogo.name}"
-                )
-                self.atualizar_interface()
-                
-                destino_jogo = self.destino / jogo.name
-                bytes_copiados, _ = self.copiar_jogo_completo(jogo, destino_jogo, progresso_info)
-                
-                if bytes_copiados > 0:
-                    jogos_copiados += 1
-            
-            # Finalização
-            tempo_total = time.time() - self.estatisticas['tempo_inicio']
-            
-            if self.cancelar_copia:
-                self.status_var.set("⚠️ Cópia cancelada pelo usuário")
-                messagebox.showwarning(
-                    "Cancelado",
-                    f"Cópia interrompida!\n\n"
-                    f"Jogos processados: {jogos_copiados}/{len(jogos)}\n"
-                    f"Dados copiados: {self.formatar_tamanho(progresso_info['copiado'])}"
-                )
-            else:
-                self.status_var.set("✅ Cópia concluída com sucesso!")
-                self.detalhes_var.set(
-                    f"Tempo total: {timedelta(seconds=int(tempo_total))} • "
-                    f"Velocidade média: {self.formatar_tamanho(progresso_info['copiado']/tempo_total)}/s"
-                )
-                messagebox.showinfo(
-                    "Concluído! 🎉",
-                    f"Cópia finalizada com sucesso!\n\n"
-                    f"📁 Jogos copiados: {jogos_copiados}/{len(jogos)}\n"
-                    f"📄 Arquivos processados: {self.estatisticas['arquivos_copiados']}\n"
-                    f"✂️ Arquivos divididos: {self.estatisticas['arquivos_divididos']}\n"
-                    f"💾 Total copiado: {self.formatar_tamanho(progresso_info['copiado'])}\n"
-                    f"⏱️ Tempo: {timedelta(seconds=int(tempo_total))}\n\n"
-                    f"Log salvo em: {LOG_FILE}"
-                )
-            
-        except Exception as e:
-            logging.error(f"ERRO CRÍTICO: {e}", exc_info=True)
-            messagebox.showerror(
-                "Erro Crítico",
-                f"Ocorreu um erro durante a cópia:\n\n{str(e)}\n\n"
-                f"Consulte o log para mais detalhes: {LOG_FILE}"
-            )
-        finally:
-            # Reset do estado
-            self.copiar_ativo = False
-            self.cancelar_copia = False
-            self.pausar_copia = False
-            self.btn_iniciar["state"] = tk.NORMAL
-            self.btn_pausar["state"] = tk.DISABLED
-            self.btn_cancelar["state"] = tk.DISABLED
-            self.atualizar_interface()
-    
-    def pausar_retomar_copia(self):
-        """Pausa ou retoma a cópia"""
-        if self.pausar_copia:
-            self.pausar_copia = False
-            self.btn_pausar["text"] = "⏸️ PAUSAR"
-            self.status_var.set("▶️ Cópia retomada...")
-        else:
-            self.pausar_copia = True
-            self.btn_pausar["text"] = "▶️ RETOMAR"
-            self.status_var.set("⏸️ Cópia pausada...")
-    
-    def cancelar_copia_func(self):
-        """Cancela a cópia em andamento"""
-        if messagebox.askyesno("Confirmar", "Deseja realmente cancelar a cópia?"):
-            self.cancelar_copia = True
-            self.pausar_copia = False
-            self.btn_cancelar["state"] = tk.DISABLED
-            self.btn_pausar["state"] = tk.DISABLED
-            self.status_var.set("🛑 Cancelando operação...")
-            self.detalhes_var.set("Aguarde, finalizando operações em andamento...")
-    
-    def atualizar_interface(self):
-        """Atualiza a interface gráfica de forma segura"""
-        try:
-            self.root.update_idletasks()
-            self.root.update()
-        except tk.TclError:
-            pass  # Janela foi fechada
-    
-    def validar_caminhos(self):
-        """Valida se os caminhos são válidos antes de iniciar"""
-        self.origem = Path(self.origem_entry.get().strip())
-        self.destino = Path(self.destino_entry.get().strip())
+        ttk.Button(settings_frame, text="Save Settings", command=self.save_settings).pack(side="left", padx=5)
+        ttk.Button(settings_frame, text="Reset to Defaults", command=self.reset_settings).pack(side="left", padx=5)
+
+    def setup_log_tab(self):
+        log_frame = ttk.Frame(self.log_frame, padding=10)
+        log_frame.pack(fill=tk.BOTH, expand=True)
         
-        if not self.origem.exists():
-            raise FileNotFoundError(f"Pasta de origem não encontrada:\n{self.origem}")
+        # Log text widget with scrollbar
+        self.log_text = tk.Text(log_frame, height=25, wrap=tk.WORD)
+        log_scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scroll.set)
         
-        if not self.destino.exists():
-            raise FileNotFoundError(f"Pasta de destino não encontrada:\n{self.destino}")
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def save_settings(self):
+        """Save current settings to config"""
+        self.config.update({
+            'buffer_size': self.buffer_var.get() * 1024 * 1024,
+            'max_retries': self.retry_var.get(),
+            'retry_delay': self.retry_delay_var.get(),
+            'verify_signatures': self.signature_var.get(),
+            'create_backup': self.backup_var.get()
+        })
+        self.save_config()
+        messagebox.showinfo("Settings", "Settings saved successfully!")
+
+    def reset_settings(self):
+        """Reset settings to defaults"""
+        self.config = {
+            'buffer_size': self.calculate_optimal_buffer_size(),
+            'max_retries': 3,
+            'retry_delay': 2,
+            'verify_signatures': True,
+            'create_backup': False,
+            'show_advanced': False
+        }
+        self.update_advanced_ui()
+        messagebox.showinfo("Settings", "Settings reset to defaults!")
+
+    def update_advanced_ui(self):
+        """Update advanced tab UI with current settings"""
+        self.buffer_var.set(self.config['buffer_size'] // (1024*1024))
+        self.retry_var.set(self.config['max_retries'])
+        self.retry_delay_var.set(self.config['retry_delay'])
+        self.signature_var.set(self.config['verify_signatures'])
+        self.backup_var.set(self.config['create_backup'])
+
+    def clear_log(self):
+        """Clear the log display"""
+        self.log_text.delete(1.0, tk.END)
+
+    def log_to_ui(self, message: str, level: str = "INFO"):
+        """Add message to UI log"""
+        timestamp = time.strftime("%H:%M:%S")
+        formatted_msg = f"[{timestamp}] {level}: {message}\n"
         
-        if not self.origem.is_dir():
-            raise ValueError("Origem deve ser uma pasta")
+        def update_log():
+            self.log_text.insert(tk.END, formatted_msg)
+            self.log_text.see(tk.END)
         
-        if not self.destino.is_dir():
-            raise ValueError("Destino deve ser uma pasta")
-        
-        # Verifica se não são a mesma pasta
-        if self.origem.resolve() == self.destino.resolve():
-            raise ValueError("Origem e destino não podem ser a mesma pasta")
-    
-    def iniciar_copia(self):
-        """Inicia o processo de cópia com validações"""
-        if self.copiar_ativo:
+        self.gui_queue.put(update_log)
+
+    def browse_source(self):
+        path = filedialog.askdirectory(initialdir=str(self.source), title="Select folder with PS3 games")
+        if path:
+            self.source = Path(path)
+            self.source_entry.delete(0, tk.END)
+            self.source_entry.insert(0, str(self.source))
+
+    def browse_dest(self):
+        initial_dir = str(self.dest) if self.dest.exists() else str(Path(self.source) / "GAMES")
+        path = filedialog.askdirectory(initialdir=initial_dir, title="Select or create GAMES folder on FAT32 drive")
+        if path:
+            self.dest = Path(path)
+            self.dest_entry.delete(0, tk.END)
+            self.dest_entry.insert(0, str(self.dest))
+
+    def scan_games_preview(self):
+        """Scan and preview games that will be copied"""
+        if not self.source_entry.get():
+            messagebox.showwarning("Warning", "Please select a source folder first!")
             return
         
+        self.source = Path(self.source_entry.get())
+        if not self.source.exists():
+            messagebox.showerror("Error", "Source folder doesn't exist!")
+            return
+        
+        # Clear existing items
+        for item in self.game_tree.get_children():
+            self.game_tree.delete(item)
+        
+        # Scan for games
+        threading.Thread(target=self._scan_games_thread, daemon=True).start()
+
+    def _scan_games_thread(self):
+        """Thread function to scan games"""
         try:
-            # Validações
-            self.validar_caminhos()
+            games_found = 0
+            total_size = 0
             
-            # Confirmação do usuário
-            resposta = messagebox.askyesno(
-                "Confirmar Cópia",
-                f"Iniciar cópia de jogos PS3?\n\n"
-                f"📂 Origem: {self.origem}\n"
-                f"📁 Destino: {self.destino}\n\n"
-                f"⚙️ Divisão de arquivos: {'✅ Ativada' if self.divisao_var.get() else '❌ Desativada'}\n"
-                f"🔄 Sobrescrever: {'✅ Sim' if self.sobrescrever_var.get() else '❌ Não'}\n"
-                f"✅ Verificar integridade: {'✅ Sim' if self.verificar_integridade_var.get() else '❌ Não'}\n\n"
-                f"⚠️ Esta operação pode demorar dependendo do tamanho dos jogos.",
-                icon='question'
-            )
+            for game_folder in self.scan_source():
+                if self.is_valid_ps3_folder(game_folder):
+                    size = self.get_folder_size(game_folder)
+                    game_type = self.detect_game_type(game_folder)
+                    status = "Ready"
+                    
+                    # Check for duplicates if destination exists
+                    if self.dest_entry.get() and Path(self.dest_entry.get()).exists():
+                        dest_folder = Path(self.dest_entry.get()) / self.sanitize_folder_name(game_folder.name)
+                        if dest_folder.exists():
+                            status = "Duplicate"
+                    
+                    # Add to tree view
+                    self.gui_queue.put(lambda f=game_folder, s=size, t=game_type, st=status: 
+                        self.game_tree.insert('', 'end', values=(
+                            f.name, 
+                            self.format_size(s), 
+                            t, 
+                            st
+                        ))
+                    )
+                    
+                    games_found += 1
+                    total_size += size
             
-            if not resposta:
-                return
-            
-            # Salva configurações
-            self.salvar_config()
-            
-            # Prepara interface
-            self.btn_iniciar["state"] = tk.DISABLED
-            self.btn_pausar["state"] = tk.NORMAL
-            self.btn_cancelar["state"] = tk.NORMAL
-            
-            # Inicia thread de cópia
-            threading.Thread(
-                target=self.processo_copia_principal,
-                daemon=True,
-                name="CopiaThread"
-            ).start()
+            # Update summary
+            self.gui_queue.put(lambda: self.log_to_ui(
+                f"Scan complete: {games_found} games found ({self.format_size(total_size)} total)"
+            ))
             
         except Exception as e:
-            messagebox.showerror("Erro de Validação", str(e))
-    
-    def ao_fechar(self):
-        """Protocolo de fechamento da aplicação"""
-        if self.copiar_ativo:
-            resposta = messagebox.askyesnocancel(
-                "Fechar Aplicação",
-                "Há uma cópia em andamento!\n\n"
-                "Deseja cancelar a cópia e fechar o programa?",
-                icon='warning'
+            self.gui_queue.put(lambda: self.log_to_ui(f"Scan error: {e}", "ERROR"))
+
+    def detect_game_type(self, folder: Path) -> str:
+        """Detect if game is disc image or folder game"""
+        if (folder / "PS3_DISC.SFB").exists():
+            return "Disc Image"
+        elif (folder / "PS3_GAME" / "PARAM.SFO").exists():
+            return "Folder Game"
+        else:
+            return "Unknown"
+
+    def start_copy(self):
+        if not self.validate_paths():
+            return
+        
+        # Update config from UI
+        self.config['buffer_size'] = self.buffer_var.get() * 1024 * 1024
+        self.config['max_retries'] = self.retry_var.get()
+        self.config['retry_delay'] = self.retry_delay_var.get()
+        self.config['verify_signatures'] = self.signature_var.get()
+        self.config['create_backup'] = self.backup_var.get()
+        
+        self.prepare_for_copy()
+        threading.Thread(target=self.copy_process, daemon=True).start()
+
+    def validate_paths(self):
+        self.source = Path(self.source_entry.get())
+        self.dest = Path(self.dest_entry.get())
+        
+        if not self.source.exists():
+            messagebox.showerror("Error", "Source folder doesn't exist!")
+            return False
+            
+        if not self.dest.exists():
+            try:
+                self.dest.mkdir(parents=True)
+                self.log_to_ui(f"Created destination folder: {self.dest}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Couldn't create destination folder:\n{e}")
+                return False
+        
+        # Enhanced FAT32 validation
+        if not self.validate_fat32_destination():
+            return False
+                
+        return True
+
+    def validate_fat32_destination(self) -> bool:
+        """Enhanced FAT32 validation"""
+        try:
+            # Test file creation
+            test_file = self.dest / "~fat32test.tmp"
+            with open(test_file, 'wb') as f:
+                f.write(b'PS3 Game Copier test file - safe to delete')
+            
+            # Test long filename support
+            long_name = "a" * 200 + ".tmp"
+            long_test = self.dest / long_name
+            try:
+                with open(long_test, 'wb') as f:
+                    f.write(b'test')
+                long_test.unlink()
+                self.log_to_ui("Long filename support confirmed")
+            except:
+                self.log_to_ui("Long filename support limited", "WARNING")
+            
+            test_file.unlink()
+            
+            # Check available space
+            free_space = shutil.disk_usage(self.dest)[2]
+            self.log_to_ui(f"Available space: {self.format_size(free_space)}")
+            
+            return True
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Destination validation failed:\n{e}")
+            return False
+
+    def sanitize_folder_name(self, name: str) -> str:
+        """Enhanced folder name sanitization for FAT32"""
+        original_name = name
+        
+        # Replace invalid FAT32 characters
+        name = re.sub(r'[\\/*?:"<>|]', '_', name)
+        
+        # Handle reserved names
+        name_upper = name.upper()
+        if name_upper in FAT32_RESERVED_NAMES or name_upper.split('.')[0] in FAT32_RESERVED_NAMES:
+            name = f"_{name}"
+        
+        # Remove trailing dots and spaces
+        name = name.rstrip('. ')
+        
+        # Ensure not empty
+        if not name:
+            name = "PS3_Game"
+        
+        # Trim to reasonable length (FAT32 max is 255 chars, but we'll use 128)
+        if len(name) > 128:
+            name = name[:125] + "..."
+        
+        if name != original_name:
+            self.log_to_ui(f"Sanitized folder name: '{original_name}' -> '{name}'")
+            
+        return name
+
+    def prepare_for_copy(self):
+        self.is_running = True
+        self.should_cancel = False
+        self.start_btn.config(state=tk.DISABLED)
+        self.cancel_btn.config(state=tk.NORMAL)
+        self.status_var.set("Status: Preparing...")
+        self.file_var.set("Scanning for PS3 games...")
+        
+        # Load resume data if available
+        self.load_resume_data()
+
+    def load_resume_data(self):
+        """Load resume data from previous interrupted session"""
+        try:
+            if Path(RESUME_FILE).exists() and self.resume_var.get():
+                with open(RESUME_FILE, 'r') as f:
+                    self.resume_data = json.load(f)
+                self.log_to_ui(f"Loaded resume data: {len(self.resume_data)} entries")
+        except Exception as e:
+            self.log_to_ui(f"Could not load resume data: {e}", "WARNING")
+            self.resume_data = {}
+
+    def save_resume_data(self):
+        """Save resume data for interrupted sessions"""
+        try:
+            with open(RESUME_FILE, 'w') as f:
+                json.dump(self.resume_data, f, indent=2)
+        except Exception as e:
+            self.log_to_ui(f"Could not save resume data: {e}", "WARNING")
+
+    def copy_process(self):
+        try:
+            self.initialize_copy()
+            
+            if self.dry_run_var.get():
+                self.perform_dry_run()
+            else:
+                # Process all game files
+                for game_file in self.scan_source():
+                    if self.should_cancel:
+                        break
+                    
+                    if self.is_valid_ps3_folder(game_file):
+                        self.process_game(game_file)
+            
+            self.finalize_copy()
+            
+        except Exception as e:
+            self.handle_error(e)
+        finally:
+            self.cleanup()
+
+    def perform_dry_run(self):
+        """Perform a dry run showing what would be copied"""
+        self.log_to_ui("=== DRY RUN MODE ===")
+        games_to_copy = []
+        total_size = 0
+        
+        for game_folder in self.scan_source():
+            if self.should_cancel:
+                break
+                
+            if self.is_valid_ps3_folder(game_folder):
+                size = self.get_folder_size(game_folder)
+                dest_folder = self.dest / self.sanitize_folder_name(game_folder.name)
+                
+                status = "COPY"
+                if dest_folder.exists() and self.skip_duplicates_var.get():
+                    status = "SKIP (duplicate)"
+                
+                games_to_copy.append((game_folder.name, size, status))
+                if status == "COPY":
+                    total_size += size
+                
+                self.log_to_ui(f"{status}: {game_folder.name} ({self.format_size(size)})")
+        
+        self.log_to_ui(f"\nDry run summary:")
+        self.log_to_ui(f"Games found: {len(games_to_copy)}")
+        self.log_to_ui(f"Games to copy: {sum(1 for _, _, status in games_to_copy if status == 'COPY')}")
+        self.log_to_ui(f"Total size to copy: {self.format_size(total_size)}")
+        self.log_to_ui("=== END DRY RUN ===")
+
+    def scan_source(self):
+        """Enhanced source scanning with validation"""
+        if not self.source.exists():
+            return
+            
+        for item in self.source.iterdir():
+            if item.is_dir():
+                yield item
+
+    def is_valid_ps3_folder(self, folder: Path) -> bool:
+        """Enhanced PS3 folder validation with signature checking"""
+        # Basic file existence check
+        has_disc_sfb = (folder / "PS3_DISC.SFB").exists()
+        has_param_sfo = (folder / "PS3_GAME" / "PARAM.SFO").exists() or (folder / "PARAM.SFO").exists()
+        
+        if not (has_disc_sfb or has_param_sfo):
+            return False
+        
+        # Optional signature validation
+        if self.config['verify_signatures']:
+            return self.verify_ps3_signatures(folder)
+        
+        return True
+
+    def verify_ps3_signatures(self, folder: Path) -> bool:
+        """Verify PS3 file signatures"""
+        try:
+            for filename, signature in PS3_FILE_SIGNATURES.items():
+                file_paths = [
+                    folder / filename,
+                    folder / "PS3_GAME" / filename
+                ]
+                
+                for file_path in file_paths:
+                    if file_path.exists():
+                        with open(file_path, 'rb') as f:
+                            file_header = f.read(len(signature))
+                            if file_header == signature:
+                                return True
+            
+            return True  # If no signature files found, assume valid
+            
+        except Exception as e:
+            self.log_to_ui(f"Signature verification failed for {folder.name}: {e}", "WARNING")
+            return True  # Don't reject on verification errors
+
+    def process_game(self, game_folder: Path):
+        """Enhanced game processing with retry logic"""
+        folder_name = game_folder.name
+        self.stats['current_file'] = folder_name
+        self.update_file_status()
+        
+        dest_folder = self.dest / self.sanitize_folder_name(folder_name)
+        
+        # Check for duplicates
+        if dest_folder.exists() and self.skip_duplicates_var.get():
+            self.log_to_ui(f"Skipping duplicate: {folder_name}")
+            self.stats['skipped'] += 1
+            self.update_stats()
+            return
+        
+        # Check resume data
+        resume_key = f"{game_folder}>{dest_folder}"
+        if resume_key in self.resume_data and self.resume_data[resume_key].get('completed'):
+            self.log_to_ui(f"Resuming: {folder_name} already completed")
+            self.stats['copied'] += 1
+            self.update_stats()
+            return
+        
+        # Attempt copy with retry logic
+        for attempt in range(1, self.config['max_retries'] + 1):
+            try:
+                if self.copy_ps3_folder_with_retry(game_folder, dest_folder, attempt):
+                    # Mark as completed in resume data
+                    self.resume_data[resume_key] = {
+                        'completed': True,
+                        'timestamp': time.time(),
+                        'size': self.get_folder_size(game_folder)
+                    }
+                    self.save_resume_data()
+                    break
+            except Exception as e:
+                self.stats['retry_count'] += 1
+                if attempt < self.config['max_retries']:
+                    self.log_to_ui(f"Retry {attempt}/{self.config['max_retries']} for {folder_name}: {e}", "WARNING")
+                    time.sleep(self.config['retry_delay'])
+                else:
+                    self.log_to_ui(f"Failed after {self.config['max_retries']} attempts: {folder_name}: {e}", "ERROR")
+                    self.stats['failed'] += 1
+                    self.update_stats()
+                    return
+
+    def copy_ps3_folder_with_retry(self, src: Path, dest: Path, attempt: int) -> bool:
+        """Enhanced PS3 folder copy with comprehensive error handling"""
+        try:
+            # Create backup if requested
+            if dest.exists() and self.config['create_backup']:
+                backup_path = dest.parent / f"{dest.name}_backup_{int(time.time())}"
+                shutil.move(str(dest), str(backup_path))
+                self.log_to_ui(f"Created backup: {backup_path.name}")
+            
+            # Clean destination if it exists
+            if dest.exists():
+                self.safe_remove_directory(dest)
+                
+            # Create destination folder
+            os.makedirs(dest, exist_ok=True)
+            
+            # Copy all contents while preserving structure
+            copied_files = 0
+            total_files = sum(1 for _ in src.rglob('*') if _.is_file())
+            
+            for item in src.rglob('*'):
+                if self.should_cancel:
+                    return False
+                    
+                if item.is_file():
+                    relative_path = item.relative_to(src)
+                    dest_item = dest / relative_path
+                    
+                    # Ensure parent directory exists
+                    os.makedirs(dest_item.parent, exist_ok=True)
+                    
+                    # Copy file with enhanced logic
+                    if self.copy_file_enhanced(item, dest_item):
+                        copied_files += 1
+                    else:
+                        raise Exception(f"Failed to copy {item.name}")
+            
+            # Verify essential PS3 files were copied
+            self.verify_ps3_files_enhanced(dest)
+            
+            self.log_to_ui(f"Successfully copied {src.name} ({copied_files}/{total_files} files)")
+            self.update_stats(1, self.get_folder_size(src))
+            return True
+            
+        except Exception as e:
+            self.log_to_ui(f"Copy failed for {src.name} (attempt {attempt}): {e}", "ERROR")
+            # Clean up partial copy
+            if dest.exists():
+                self.safe_remove_directory(dest)
+            raise
+
+    def safe_remove_directory(self, path: Path):
+        """Safely remove directory with proper error handling"""
+        try:
+            if path.exists():
+                # Try normal removal first
+                shutil.rmtree(path)
+        except OSError as e:
+            # If normal removal fails, try to handle locked files
+            self.log_to_ui(f"Retrying removal of {path.name} due to: {e}", "WARNING")
+            try:
+                # Force removal of read-only files
+                def handle_remove_readonly(func, path, exc):
+                    os.chmod(path, 0o777)
+                    func(path)
+                
+                shutil.rmtree(path, onerror=handle_remove_readonly)
+            except Exception as e2:
+                self.log_to_ui(f"Could not remove {path.name}: {e2}", "ERROR")
+                raise
+
+    def copy_file_enhanced(self, src: Path, dest: Path) -> bool:
+        """Enhanced file copying with comprehensive validation"""
+        if self.should_cancel:
+            return False
+            
+        try:
+            file_size = src.stat().st_size
+            
+            # Handle large files that need splitting
+            if file_size > FAT32_LIMIT and self.split_var.get():
+                return self.split_file_enhanced(src, dest)
+            
+            # Use temporary file for safer copying
+            temp_file = dest.parent / f"~temp_{dest.name}_{int(time.time())}"
+            
+            try:
+                # Copy with custom buffer size
+                with open(src, 'rb') as f_src, open(temp_file, 'wb') as f_dest:
+                    copied = 0
+                    while copied < file_size and not self.should_cancel:
+                        chunk = f_src.read(self.config['buffer_size'])
+                        if not chunk:
+                            break
+                        f_dest.write(chunk)
+                        copied += len(chunk)
+                        
+                        # Update progress for large files
+                        if file_size > 100 * 1024 * 1024:  # 100MB
+                            self.update_stats(0, len(chunk))
+                
+                if self.should_cancel:
+                    temp_file.unlink()
+                    return False
+                
+                # Verify copy if enabled
+                if self.verify_var.get():
+                    if not self.verify_copy_enhanced(src, temp_file):
+                        temp_file.unlink()
+                        raise Exception("File verification failed")
+                
+                # Atomic move to final location
+                os.replace(temp_file, dest)
+                
+                # Copy file attributes
+                shutil.copystat(src, dest)
+                
+                self.update_stats(1, file_size)
+                return True
+                
+            except Exception as e:
+                if temp_file.exists():
+                    temp_file.unlink()
+                raise
+                
+        except Exception as e:
+            self.log_to_ui(f"File copy failed: {src.name}: {e}", "ERROR")
+            return False
+
+    def verify_copy_enhanced(self, src: Path, dest: Path) -> bool:
+        """Enhanced copy verification with multiple checks"""
+        try:
+            # Size check
+            src_size = src.stat().st_size
+            dest_size = dest.stat().st_size
+            
+            if src_size != dest_size:
+                self.log_to_ui(f"Size mismatch: {src.name} ({src_size} vs {dest_size})", "ERROR")
+                return False
+            
+            # Hash verification for smaller files or critical PS3 files
+            should_hash = (
+                src_size < 100 * 1024 * 1024 or  # Files under 100MB
+                src.name in PS3_FILE_SIGNATURES or  # Critical PS3 files
+                src.suffix.lower() in ['.sfo', '.sfb', '.bin']  # Important extensions
             )
             
-            if resposta is True:  # Sim, fechar
-                self.cancelar_copia = True
-                self.pausar_copia = False
-                # Aguarda um pouco para a thread finalizar
-                self.root.after(1000, self.root.destroy)
-            elif resposta is False:  # Não, continuar
-                return
-            # None = Cancelar, não faz nada
+            if should_hash:
+                src_hash = self.calculate_hash_chunked(src)
+                dest_hash = self.calculate_hash_chunked(dest)
+                
+                if src_hash != dest_hash:
+                    self.log_to_ui(f"Hash mismatch: {src.name}", "ERROR")
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            self.log_to_ui(f"Verification error: {src.name}: {e}", "ERROR")
+            return False
+
+    def calculate_hash_chunked(self, file_path: Path) -> str:
+        """Calculate hash with chunked reading for memory efficiency"""
+        sha256 = hashlib.sha256()
+        try:
+            with open(file_path, 'rb') as f:
+                while chunk := f.read(self.config['buffer_size']):
+                    if self.should_cancel:
+                        return ""
+                    sha256.update(chunk)
+            return sha256.hexdigest()
+        except Exception as e:
+            self.log_to_ui(f"Hash calculation failed: {file_path.name}: {e}", "ERROR")
+            return ""
+
+    def split_file_enhanced(self, src: Path, dest_base: Path) -> bool:
+        """Enhanced file splitting with comprehensive validation"""
+        try:
+            file_size = src.stat().st_size
+            part_num = 0
+            remaining = file_size
+            parts_created = []
+            
+            self.log_to_ui(f"Splitting large file: {src.name} ({self.format_size(file_size)})")
+            
+            with open(src, 'rb') as f_src:
+                while remaining > 0 and not self.should_cancel:
+                    part_num += 1
+                    part_path = dest_base.parent / f"{dest_base.name}{PS3_SPLIT_EXT}{part_num:02d}"
+                    
+                    chunk_size = min(FAT32_LIMIT, remaining)
+                    temp_part = part_path.parent / f"~temp_{part_path.name}_{int(time.time())}"
+                    
+                    try:
+                        # Write part file
+                        with open(temp_part, 'wb') as f_part:
+                            part_written = 0
+                            while part_written < chunk_size and not self.should_cancel:
+                                read_size = min(self.config['buffer_size'], chunk_size - part_written)
+                                chunk = f_src.read(read_size)
+                                if not chunk:
+                                    break
+                                f_part.write(chunk)
+                                part_written += len(chunk)
+                                remaining -= len(chunk)
+                                self.update_stats(0, len(chunk))
+                        
+                        if self.should_cancel:
+                            temp_part.unlink()
+                            break
+                        
+                        # Verify part if enabled
+                        if self.verify_var.get():
+                            if not self.verify_split_part(src, temp_part, file_size - remaining - part_written, file_size - remaining):
+                                temp_part.unlink()
+                                raise Exception(f"Part {part_num} verification failed")
+                        
+                        # Move to final location
+                        os.replace(temp_part, part_path)
+                        parts_created.append(part_path)
+                        
+                        self.log_to_ui(f"Created part {part_num}: {part_path.name}")
+                        
+                    except Exception as e:
+                        if temp_part.exists():
+                            temp_part.unlink()
+                        raise Exception(f"Failed to create part {part_num}: {e}")
+            
+            if self.should_cancel:
+                # Clean up all parts
+                for part in parts_created:
+                    try:
+                        part.unlink()
+                    except:
+                        pass
+                return False
+            
+            self.log_to_ui(f"Successfully split {src.name} into {part_num} parts")
+            self.stats['split'] += 1
+            return True
+            
+        except Exception as e:
+            self.log_to_ui(f"File splitting failed: {src.name}: {e}", "ERROR")
+            return False
+
+    def verify_split_part(self, src: Path, part: Path, start_offset: int, end_offset: int) -> bool:
+        """Verify a part of a split file"""
+        try:
+            # Read the corresponding section from source
+            with open(src, 'rb') as f_src:
+                f_src.seek(start_offset)
+                expected_data = f_src.read(end_offset - start_offset)
+            
+            # Read the part file
+            with open(part, 'rb') as f_part:
+                actual_data = f_part.read()
+            
+            return expected_data == actual_data
+            
+        except Exception as e:
+            self.log_to_ui(f"Part verification error: {part.name}: {e}", "ERROR")
+            return False
+
+    def verify_ps3_files_enhanced(self, folder: Path):
+        """Enhanced PS3 file verification"""
+        missing_files = []
+        corrupted_files = []
+        
+        # Check essential files
+        essential_files = [
+            ('PS3_DISC.SFB', folder),
+            ('PARAM.SFO', folder),
+            ('PARAM.SFO', folder / 'PS3_GAME'),
+            ('ICON0.PNG', folder),
+            ('ICON0.PNG', folder / 'PS3_GAME')
+        ]
+        
+        for filename, location in essential_files:
+            file_path = location / filename
+            if file_path.exists():
+                # Verify file signature if applicable
+                if filename in PS3_FILE_SIGNATURES and self.config['verify_signatures']:
+                    try:
+                        with open(file_path, 'rb') as f:
+                            header = f.read(len(PS3_FILE_SIGNATURES[filename]))
+                            if header != PS3_FILE_SIGNATURES[filename]:
+                                corrupted_files.append(str(file_path.relative_to(folder)))
+                    except Exception as e:
+                        self.log_to_ui(f"Could not verify signature for {filename}: {e}", "WARNING")
+            else:
+                missing_files.append(str(location.relative_to(folder) / filename))
+        
+        if missing_files:
+            self.log_to_ui(f"Missing PS3 files in {folder.name}: {', '.join(missing_files)}", "WARNING")
+        
+        if corrupted_files:
+            self.log_to_ui(f"Corrupted PS3 files in {folder.name}: {', '.join(corrupted_files)}", "ERROR")
+
+    def get_folder_size(self, folder: Path) -> int:
+        """Enhanced folder size calculation with error handling"""
+        try:
+            total_size = 0
+            for file_path in folder.rglob('*'):
+                if file_path.is_file():
+                    try:
+                        total_size += file_path.stat().st_size
+                    except (OSError, IOError):
+                        # Skip files that can't be accessed
+                        continue
+            return total_size
+        except Exception as e:
+            self.log_to_ui(f"Could not calculate size for {folder.name}: {e}", "WARNING")
+            return 0
+
+    def initialize_copy(self):
+        """Enhanced copy initialization"""
+        self.stats = {
+            'total_files': 0,
+            'total_size': 0,
+            'copied': 0,
+            'split': 0,
+            'skipped': 0,
+            'failed': 0,
+            'bytes_copied': 0,
+            'start_time': time.time(),
+            'current_file': "",
+            'retry_count': 0
+        }
+        
+        # Count valid game folders and total size
+        valid_games = []
+        for game_folder in self.scan_source():
+            if self.is_valid_ps3_folder(game_folder):
+                size = self.get_folder_size(game_folder)
+                valid_games.append((game_folder, size))
+                self.stats['total_files'] += 1
+                self.stats['total_size'] += size
+        
+        self.progress.config(maximum=self.stats['total_files'], value=0)
+        self.status_var.set("Status: Copying PS3 games...")
+        
+        self.log_to_ui(f"Starting copy of {self.stats['total_files']} games ({self.format_size(self.stats['total_size'])})")
+
+    def update_file_status(self):
+        """Enhanced file status updates"""
+        def update():
+            progress_text = (
+                f"Processing: {self.stats['current_file']}\n"
+                f"Progress: {self.stats['copied']}/{self.stats['total_files']} games | "
+                f"Skipped: {self.stats['skipped']} | Failed: {self.stats['failed']}"
+            )
+            if self.stats['retry_count'] > 0:
+                progress_text += f" | Retries: {self.stats['retry_count']}"
+            
+            self.file_var.set(progress_text)
+        
+        self.gui_queue.put(update)
+
+    def update_stats(self, files: int = 0, bytes_copied: int = 0):
+        """Enhanced statistics updates"""
+        def update():
+            self.stats['copied'] += files
+            self.stats['bytes_copied'] += bytes_copied
+            
+            self.progress['value'] = self.stats['copied']
+            
+            elapsed = time.time() - self.stats['start_time']
+            if elapsed > 0:
+                speed = self.stats['bytes_copied'] / elapsed
+                
+                # Estimate remaining time
+                remaining_files = self.stats['total_files'] - self.stats['copied'] - self.stats['skipped'] - self.stats['failed']
+                remaining_bytes = self.stats['total_size'] - self.stats['bytes_copied']
+                
+                if speed > 0 and remaining_bytes > 0:
+                    eta_seconds = remaining_bytes / speed
+                    eta = timedelta(seconds=int(eta_seconds))
+                else:
+                    eta = "Calculating..."
+                
+                self.status_var.set(
+                    f"Status: Copying... | Speed: {self.format_size(speed)}/s | "
+                    f"ETA: {eta} | Data: {self.format_size(self.stats['bytes_copied'])}/{self.format_size(self.stats['total_size'])}"
+                )
+        
+        self.gui_queue.put(update)
+
+    def format_size(self, bytes_val: int) -> str:
+        """Enhanced size formatting"""
+        if bytes_val == 0:
+            return "0 B"
+        
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB']:
+            if bytes_val < 1024.0:
+                if unit == 'B':
+                    return f"{int(bytes_val)} {unit}"
+                else:
+                    return f"{bytes_val:.1f} {unit}"
+            bytes_val /= 1024.0
+        return f"{bytes_val:.1f} EB"
+
+    def finalize_copy(self):
+        """Enhanced copy finalization"""
+        elapsed = time.time() - self.stats['start_time']
+        speed = self.stats['bytes_copied'] / elapsed if elapsed > 0 else 0
+        
+        # Clean up resume file if everything completed successfully
+        if not self.should_cancel and self.stats['failed'] == 0:
+            try:
+                if Path(RESUME_FILE).exists():
+                    Path(RESUME_FILE).unlink()
+                    self.log_to_ui("Cleaned up resume data")
+            except:
+                pass
+        
+        # Prepare summary message
+        if self.should_cancel:
+            title = "Operation Cancelled"
+            message = (
+                f"Operation cancelled by user!\n\n"
+                f"Results:\n"
+                f"• Copied: {self.stats['copied']} games\n"
+                f"• Skipped: {self.stats['skipped']} games\n"
+                f"• Failed: {self.stats['failed']} games\n"
+                f"• Split files: {self.stats['split']}\n"
+                f"• Data copied: {self.format_size(self.stats['bytes_copied'])}\n"
+                f"• Time elapsed: {timedelta(seconds=int(elapsed))}\n"
+                f"• Retries: {self.stats['retry_count']}"
+            )
+        elif self.dry_run_var.get():
+            title = "Dry Run Complete"
+            message = "Dry run completed successfully!\nCheck the log for details."
         else:
-            # Salva configurações antes de fechar
-            self.salvar_config()
+            title = "Copy Complete"
+            success_rate = (self.stats['copied'] / max(1, self.stats['total_files'])) * 100
+            message = (
+                f"Successfully completed PS3 game copy!\n\n"
+                f"Results:\n"
+                f"• Copied: {self.stats['copied']}/{self.stats['total_files']} games ({success_rate:.1f}%)\n"
+                f"• Skipped: {self.stats['skipped']} duplicates\n"
+                f"• Failed: {self.stats['failed']} games\n"
+                f"• Split files: {self.stats['split']}\n"
+                f"• Total data: {self.format_size(self.stats['bytes_copied'])}\n"
+                f"• Time: {timedelta(seconds=int(elapsed))}\n"
+                f"• Average speed: {self.format_size(speed)}/s\n"
+                f"• Retries: {self.stats['retry_count']}"
+            )
+        
+        self.log_to_ui("=" * 50)
+        self.log_to_ui("OPERATION COMPLETE")
+        self.log_to_ui("=" * 50)
+        for line in message.split('\n'):
+            if line.strip():
+                self.log_to_ui(line.strip())
+        
+        self.gui_queue.put(lambda: messagebox.showinfo(title, message))
+
+    def handle_error(self, error: Exception):
+        """Enhanced error handling"""
+        self.logger.error(f"COPY ERROR: {error}", exc_info=True)
+        
+        error_msg = (
+            f"An error occurred during the copy operation:\n\n"
+            f"Error: {str(error)}\n"
+            f"Current file: {self.stats.get('current_file', 'Unknown')}\n\n"
+            f"Progress when error occurred:\n"
+            f"• Copied: {self.stats['copied']} games\n"
+            f"• Failed: {self.stats['failed']} games\n"
+            f"• Data copied: {self.format_size(self.stats['bytes_copied'])}\n\n"
+            f"Check the log tab for detailed error information.\n"
+            f"Resume data has been saved for partial recovery."
+        )
+        
+        self.gui_queue.put(lambda: (
+            self.status_var.set("Status: Error occurred"),
+            self.file_var.set(f"Error processing {self.stats['current_file']}"),
+            self.log_to_ui(f"FATAL ERROR: {error}", "ERROR"),
+            messagebox.showerror("Copy Error", error_msg)
+        ))
+
+    def cleanup(self):
+        """Enhanced cleanup procedures"""
+        self.is_running = False
+        
+        # Save final resume data
+        if self.resume_data:
+            self.save_resume_data()
+        
+        def ui_cleanup():
+            self.start_btn.config(state=tk.NORMAL)
+            self.cancel_btn.config(state=tk.DISABLED)
+            
+            if self.should_cancel:
+                self.status_var.set("Status: Cancelled")
+                self.file_var.set("Operation cancelled - resume data saved")
+            else:
+                self.status_var.set("Status: Complete")
+                self.file_var.set("Ready for next operation")
+        
+        self.gui_queue.put(ui_cleanup)
+
+    def cancel_copy(self):
+        """Enhanced cancellation with cleanup confirmation"""
+        if not self.is_running:
+            return
+            
+        if messagebox.askyesno("Confirm Cancellation", 
+                              "Really cancel the operation?\n\n"
+                              "Progress will be saved for resuming later."):
+            self.should_cancel = True
+            self.log_to_ui("Cancellation requested - cleaning up safely...")
+            
+            def update_cancel_status():
+                self.status_var.set("Status: Cancelling...")
+                self.file_var.set("Safely cancelling operation... Please wait")
+                self.cancel_btn.config(state=tk.DISABLED)
+            
+            self.gui_queue.put(update_cancel_status)
+
+    def process_gui_queue(self):
+        """Enhanced GUI queue processing with error handling"""
+        processed = 0
+        max_process = 10  # Prevent GUI freezing
+        
+        while not self.gui_queue.empty() and processed < max_process:
+            try:
+                task = self.gui_queue.get_nowait()
+                if callable(task):
+                    task()
+                processed += 1
+            except queue.Empty:
+                break
+            except Exception as e:
+                self.logger.error(f"GUI task failed: {e}")
+        
+        # Schedule next processing
+        self.root.after(50, self.process_gui_queue)
+
+    def on_close(self):
+        """Enhanced window close handling"""
+        if self.is_running:
+            response = messagebox.askyesnocancel(
+                "Confirm Exit",
+                "Copy operation is in progress!\n\n"
+                "• Yes: Force quit (may lose progress)\n"
+                "• No: Cancel and continue operation\n"
+                "• Cancel: Stay in application"
+            )
+            
+            if response is True:  # Yes - force quit
+                self.should_cancel = True
+                self.log_to_ui("Force quit requested")
+                self.root.after(2000, self.root.destroy)  # Give time for cleanup
+            elif response is False:  # No - continue
+                return
+            # Cancel - do nothing (stay in app)
+        else:
+            # Save settings before closing
+            self.save_config()
             self.root.destroy()
 
 def main():
-    """Função principal com tratamento de erros"""
+    """Enhanced application entry point"""
+    # Set up enhanced logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(LOG_FILE, encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+    
     try:
-        # Configuração da janela principal
+        # Create main window
         root = tk.Tk()
-        root.withdraw()  # Esconde temporariamente
         
-        # Cria a aplicação
-        app = Split4GApp(root)
+        # Set application icon and properties
+        root.resizable(True, True)
+        root.minsize(800, 600)
         
-        # Centraliza a janela
+        # Create application instance
+        app = PS3GameCopier(root)
+        
+        # Set up window close handler
+        root.protocol("WM_DELETE_WINDOW", app.on_close)
+        
+        # Center window on screen
         root.update_idletasks()
-        width = root.winfo_reqwidth()
-        height = root.winfo_reqheight()
+        width = root.winfo_width()
+        height = root.winfo_height()
         x = (root.winfo_screenwidth() // 2) - (width // 2)
         y = (root.winfo_screenheight() // 2) - (height // 2)
         root.geometry(f"{width}x{height}+{x}+{y}")
         
-        # Mostra a janela
-        root.deiconify()
-        
-        # Inicia o loop principal
+        # Start the application
+        logging.info("PS3 Game Copier Enhanced Edition started")
         root.mainloop()
         
     except Exception as e:
-        logging.critical(f"ERRO CRÍTICO NA INICIALIZAÇÃO: {e}", exc_info=True)
+        logging.critical(f"FATAL APPLICATION ERROR: {e}", exc_info=True)
         try:
             messagebox.showerror(
-                "Erro Fatal",
-                f"Erro crítico na inicialização:\n\n{str(e)}\n\n"
-                f"O programa será encerrado.\n"
-                f"Consulte o arquivo {LOG_FILE} para mais detalhes."
+                "Fatal Error",
+                f"Application crashed with fatal error:\n\n{e}\n\n"
+                f"Please check {LOG_FILE} for detailed error information."
             )
         except:
-            print(f"ERRO CRÍTICO: {e}")
-        finally:
-            import sys
-            sys.exit(1)
+            print(f"FATAL ERROR: {e}")
+    finally:
+        logging.info("PS3 Game Copier Enhanced Edition terminated")
 
 if __name__ == "__main__":
     main()
