@@ -1,7 +1,7 @@
 import os
 import shutil
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, scrolledtext
 from pathlib import Path
 import time
 import logging
@@ -12,7 +12,7 @@ import hashlib
 import re
 import json
 import psutil
-from typing import Optional, List, Dict, Tuple
+from typing import List, Tuple, Dict, Optional  # Fixed type hint imports
 import tempfile
 
 # ===== CONSTANTS =====
@@ -121,176 +121,284 @@ class PS3GameCopier:
         }
 
     def setup_ui(self):
+        """Modern modular UI setup"""
         self.root.title("PS3 Game Copier - Enhanced Edition")
-        self.root.geometry("850x700")
+        self.root.geometry("900x750")
+        self.root.minsize(800, 600)
+        
+        # Apply modern theme
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("TNotebook.Tab", font=("Segoe UI", 10, "bold"), padding=[10, 5])
+        
+        # Create main container
+        main_container = ttk.Frame(self.root)
+        main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
         # Create notebook for tabs
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.notebook = ttk.Notebook(main_container)
+        self.notebook.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         
-        # Main tab
-        self.main_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.main_frame, text="Main")
+        # Setup tabs
         self.setup_main_tab()
-        
-        # Advanced tab
-        self.advanced_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.advanced_frame, text="Advanced")
         self.setup_advanced_tab()
-        
-        # Log tab
-        self.log_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.log_frame, text="Log")
         self.setup_log_tab()
+        
+        # Status bar
+        self.status_bar = ttk.Frame(main_container)
+        self.status_bar.pack(fill=tk.X, pady=(5, 0))
+        self.status_var = tk.StringVar(value="Status: Ready")
+        ttk.Label(self.status_bar, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W).pack(fill=tk.X)
 
     def setup_main_tab(self):
-        main_frame = ttk.Frame(self.main_frame, padding=20)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        """Modern main tab UI"""
+        self.main_frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(self.main_frame, text="Main")
         
-        # Source selection
-        ttk.Label(main_frame, text="Source Folder with PS3 Games:").pack(anchor="w")
-        self.source_entry = ttk.Entry(main_frame, width=80)
-        self.source_entry.pack(fill=tk.X, pady=5)
+        # Source section
+        src_frame = ttk.LabelFrame(self.main_frame, text="Source Directory", padding=10)
+        src_frame.pack(fill=tk.X, pady=5)
+        self.setup_source_ui(src_frame)
         
-        src_btn_frame = ttk.Frame(main_frame)
-        src_btn_frame.pack(fill=tk.X)
-        ttk.Button(src_btn_frame, text="Browse", command=self.browse_source).pack(side="right")
-        ttk.Button(src_btn_frame, text="Scan Games", command=self.scan_games_preview).pack(side="right", padx=(0,5))
+        # Destination section
+        dest_frame = ttk.LabelFrame(self.main_frame, text="Destination Directory", padding=10)
+        dest_frame.pack(fill=tk.X, pady=5)
+        self.setup_destination_ui(dest_frame)
         
-        # Destination selection
-        ttk.Label(main_frame, text="FAT32 Destination (GAMES folder):").pack(anchor="w", pady=(10,0))
-        self.dest_entry = ttk.Entry(main_frame, width=80)
-        self.dest_entry.pack(fill=tk.X, pady=5)
-        ttk.Button(main_frame, text="Browse", command=self.browse_dest).pack(anchor="e")
+        # Options section
+        opt_frame = ttk.LabelFrame(self.main_frame, text="Copy Options", padding=10)
+        opt_frame.pack(fill=tk.X, pady=5)
+        self.setup_options_ui(opt_frame)
         
-        # Options
-        options_frame = ttk.LabelFrame(main_frame, text="Options", padding=10)
-        options_frame.pack(fill=tk.X, pady=10)
-        
-        # First row of options
-        opt_row1 = ttk.Frame(options_frame)
-        opt_row1.pack(fill=tk.X)
-        
-        self.split_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opt_row1, text="Auto-split files >4GB", variable=self.split_var).pack(side="left", padx=5)
-        
-        self.verify_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opt_row1, text="Verify copied files", variable=self.verify_var).pack(side="left", padx=5)
-        
-        self.dry_run_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opt_row1, text="Dry run (preview only)", variable=self.dry_run_var).pack(side="left", padx=5)
-        
-        # Second row of options
-        opt_row2 = ttk.Frame(options_frame)
-        opt_row2.pack(fill=tk.X, pady=(5,0))
-        
-        self.skip_duplicates_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opt_row2, text="Skip duplicates", variable=self.skip_duplicates_var).pack(side="left", padx=5)
-        
-        self.resume_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opt_row2, text="Resume interrupted copies", variable=self.resume_var).pack(side="left", padx=5)
-        
-        # Game list preview
-        preview_frame = ttk.LabelFrame(main_frame, text="Games Found", padding=5)
-        preview_frame.pack(fill=tk.BOTH, expand=True, pady=10)
-        
-        # Create treeview for game list
-        columns = ('Name', 'Size', 'Type', 'Status')
-        self.game_tree = ttk.Treeview(preview_frame, columns=columns, show='headings', height=8)
-        
-        for col in columns:
-            self.game_tree.heading(col, text=col)
-            self.game_tree.column(col, width=150)
-        
-        # Scrollbars for treeview
-        tree_scroll_y = ttk.Scrollbar(preview_frame, orient=tk.VERTICAL, command=self.game_tree.yview)
-        tree_scroll_x = ttk.Scrollbar(preview_frame, orient=tk.HORIZONTAL, command=self.game_tree.xview)
-        self.game_tree.configure(yscrollcommand=tree_scroll_y.set, xscrollcommand=tree_scroll_x.set)
-        
-        self.game_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        tree_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
-        tree_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
+        # Game list section
+        game_frame = ttk.LabelFrame(self.main_frame, text="Games Preview", padding=10)
+        game_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        self.setup_game_list_ui(game_frame)
         
         # Progress section
-        progress_frame = ttk.LabelFrame(main_frame, text="Progress", padding=10)
-        progress_frame.pack(fill=tk.X, pady=10)
+        prog_frame = ttk.LabelFrame(self.main_frame, text="Progress", padding=10)
+        prog_frame.pack(fill=tk.X, pady=5)
+        self.setup_progress_ui(prog_frame)
         
-        self.progress = ttk.Progressbar(progress_frame, orient=tk.HORIZONTAL, mode='determinate')
-        self.progress.pack(fill=tk.X, pady=(0,5))
+        # Button section
+        btn_frame = ttk.Frame(self.main_frame)
+        btn_frame.pack(fill=tk.X, pady=10)
+        self.setup_buttons_ui(btn_frame)
+
+    def setup_source_ui(self, parent):
+        """UI for source selection"""
+        src_entry_frame = ttk.Frame(parent)
+        src_entry_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(src_entry_frame, text="Folder with PS3 Games:").pack(side=tk.LEFT, padx=(0, 10))
+        self.source_entry = ttk.Entry(src_entry_frame, width=60)
+        self.source_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        
+        src_btn_frame = ttk.Frame(src_entry_frame)
+        src_btn_frame.pack(side=tk.RIGHT)
+        ttk.Button(src_btn_frame, text="Browse", command=self.browse_source).pack(side=tk.LEFT, padx=2)
+        ttk.Button(src_btn_frame, text="Scan", command=self.scan_games_preview).pack(side=tk.LEFT, padx=2)
+
+    def setup_destination_ui(self, parent):
+        """UI for destination selection"""
+        dest_entry_frame = ttk.Frame(parent)
+        dest_entry_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(dest_entry_frame, text="FAT32 Destination:").pack(side=tk.LEFT, padx=(0, 10))
+        self.dest_entry = ttk.Entry(dest_entry_frame, width=60)
+        self.dest_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        
+        ttk.Button(dest_entry_frame, text="Browse", command=self.browse_dest).pack(side=tk.RIGHT)
+
+    def setup_options_ui(self, parent):
+        """UI for copy options"""
+        opt_row1 = ttk.Frame(parent)
+        opt_row1.pack(fill=tk.X, pady=5)
+        
+        self.split_var = tk.BooleanVar(value=True)
+        self.split_cb = ttk.Checkbutton(opt_row1, text="Split files >4GB", variable=self.split_var)
+        self.split_cb.pack(side=tk.LEFT, padx=10)
+        self.create_tooltip(self.split_cb, "Split large files for FAT32 compatibility")
+        
+        self.verify_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_row1, text="Verify files", variable=self.verify_var).pack(side=tk.LEFT, padx=10)
+        
+        self.dry_run_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opt_row1, text="Dry run", variable=self.dry_run_var).pack(side=tk.LEFT, padx=10)
+        
+        opt_row2 = ttk.Frame(parent)
+        opt_row2.pack(fill=tk.X, pady=5)
+        
+        self.skip_duplicates_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_row2, text="Skip duplicates", variable=self.skip_duplicates_var).pack(side=tk.LEFT, padx=10)
+        
+        self.resume_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_row2, text="Resume", variable=self.resume_var).pack(side=tk.LEFT, padx=10)
+
+    def setup_game_list_ui(self, parent):
+        """UI for game list preview"""
+        # Create treeview with scrollbars
+        columns = ('Name', 'Size', 'Type', 'Status')
+        self.game_tree = ttk.Treeview(parent, columns=columns, show='headings', height=10)
+        
+        # Configure columns
+        col_widths = {'Name': 250, 'Size': 100, 'Type': 120, 'Status': 100}
+        for col in columns:
+            self.game_tree.heading(col, text=col)
+            self.game_tree.column(col, width=col_widths.get(col, 100), anchor=tk.W)
+        
+        # Add scrollbars
+        tree_scroll_y = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=self.game_tree.yview)
+        tree_scroll_x = ttk.Scrollbar(parent, orient=tk.HORIZONTAL, command=self.game_tree.xview)
+        self.game_tree.configure(yscrollcommand=tree_scroll_y.set, xscrollcommand=tree_scroll_x.set)
+        
+        # Layout
+        self.game_tree.grid(row=0, column=0, sticky="nsew")
+        tree_scroll_y.grid(row=0, column=1, sticky="ns")
+        tree_scroll_x.grid(row=1, column=0, sticky="ew")
+        
+        # Configure grid weights
+        parent.grid_rowconfigure(0, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+    def setup_progress_ui(self, parent):
+        """UI for progress display"""
+        self.progress = ttk.Progressbar(parent, orient=tk.HORIZONTAL, mode='determinate')
+        self.progress.pack(fill=tk.X, pady=(0, 10))
         
         self.file_var = tk.StringVar(value="Ready to copy PS3 games...")
-        ttk.Label(progress_frame, textvariable=self.file_var, wraplength=700).pack(anchor="w")
+        file_label = ttk.Label(parent, textvariable=self.file_var, wraplength=700)
+        file_label.pack(fill=tk.X, pady=5)
         
-        self.status_var = tk.StringVar(value="Status: Waiting")
-        ttk.Label(progress_frame, textvariable=self.status_var).pack(anchor="w", pady=(5,0))
+        # Speed and ETA display
+        stats_frame = ttk.Frame(parent)
+        stats_frame.pack(fill=tk.X, pady=5)
         
-        # Buttons
-        btn_frame = ttk.Frame(main_frame)
-        btn_frame.pack(fill=tk.X, pady=10)
+        ttk.Label(stats_frame, text="Speed:").pack(side=tk.LEFT, padx=(0, 5))
+        self.speed_var = tk.StringVar(value="0 MB/s")
+        ttk.Label(stats_frame, textvariable=self.speed_var, width=10).pack(side=tk.LEFT, padx=(0, 15))
         
-        self.start_btn = ttk.Button(btn_frame, text="Start Copy", command=self.start_copy)
-        self.start_btn.pack(side="left", padx=5)
+        ttk.Label(stats_frame, text="ETA:").pack(side=tk.LEFT, padx=(0, 5))
+        self.eta_var = tk.StringVar(value="00:00:00")
+        ttk.Label(stats_frame, textvariable=self.eta_var, width=10).pack(side=tk.LEFT, padx=(0, 15))
         
-        self.cancel_btn = ttk.Button(btn_frame, text="Cancel", command=self.cancel_copy, state=tk.DISABLED)
-        self.cancel_btn.pack(side="left", padx=5)
+        ttk.Label(stats_frame, text="Copied:").pack(side=tk.LEFT, padx=(0, 5))
+        self.copied_var = tk.StringVar(value="0/0")
+        ttk.Label(stats_frame, textvariable=self.copied_var, width=10).pack(side=tk.LEFT)
+
+    def setup_buttons_ui(self, parent):
+        """UI for action buttons"""
+        self.start_btn = ttk.Button(parent, text="Start Copy", command=self.start_copy, width=15)
+        self.start_btn.pack(side=tk.LEFT, padx=5)
         
-        ttk.Button(btn_frame, text="Clear Log", command=self.clear_log).pack(side="right", padx=5)
+        self.cancel_btn = ttk.Button(parent, text="Cancel", command=self.cancel_copy, state=tk.DISABLED, width=15)
+        self.cancel_btn.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(parent, text="Clear Log", command=self.clear_log, width=10).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(parent, text="Settings", command=self.show_settings, width=10).pack(side=tk.RIGHT, padx=5)
 
     def setup_advanced_tab(self):
-        adv_frame = ttk.Frame(self.advanced_frame, padding=20)
-        adv_frame.pack(fill=tk.BOTH, expand=True)
+        """Modern advanced settings tab"""
+        self.advanced_frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(self.advanced_frame, text="Advanced")
         
-        # Buffer size setting
-        buffer_frame = ttk.LabelFrame(adv_frame, text="Performance Settings", padding=10)
-        buffer_frame.pack(fill=tk.X, pady=5)
+        # Performance settings
+        perf_frame = ttk.LabelFrame(self.advanced_frame, text="Performance Settings", padding=10)
+        perf_frame.pack(fill=tk.X, pady=5)
+        self.setup_performance_ui(perf_frame)
         
-        ttk.Label(buffer_frame, text="Buffer Size (MB):").pack(side="left")
-        self.buffer_var = tk.IntVar(value=self.config['buffer_size'] // (1024*1024))
-        buffer_spin = ttk.Spinbox(buffer_frame, from_=1, to=128, textvariable=self.buffer_var, width=10)
-        buffer_spin.pack(side="left", padx=5)
-        
-        # Retry settings
-        retry_frame = ttk.LabelFrame(adv_frame, text="Error Handling", padding=10)
-        retry_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(retry_frame, text="Max Retries:").pack(side="left")
-        self.retry_var = tk.IntVar(value=self.config['max_retries'])
-        retry_spin = ttk.Spinbox(retry_frame, from_=0, to=10, textvariable=self.retry_var, width=10)
-        retry_spin.pack(side="left", padx=5)
-        
-        ttk.Label(retry_frame, text="Retry Delay (seconds):").pack(side="left", padx=(20,0))
-        self.retry_delay_var = tk.IntVar(value=self.config['retry_delay'])
-        delay_spin = ttk.Spinbox(retry_frame, from_=1, to=30, textvariable=self.retry_delay_var, width=10)
-        delay_spin.pack(side="left", padx=5)
+        # Error handling
+        error_frame = ttk.LabelFrame(self.advanced_frame, text="Error Handling", padding=10)
+        error_frame.pack(fill=tk.X, pady=5)
+        self.setup_error_ui(error_frame)
         
         # Validation settings
-        validation_frame = ttk.LabelFrame(adv_frame, text="Validation Settings", padding=10)
-        validation_frame.pack(fill=tk.X, pady=5)
+        valid_frame = ttk.LabelFrame(self.advanced_frame, text="Validation Settings", padding=10)
+        valid_frame.pack(fill=tk.X, pady=5)
+        self.setup_validation_ui(valid_frame)
         
+        # Save/load settings
+        save_frame = ttk.Frame(self.advanced_frame)
+        save_frame.pack(fill=tk.X, pady=20)
+        self.setup_save_ui(save_frame)
+
+    def setup_performance_ui(self, parent):
+        """Performance settings UI"""
+        buffer_frame = ttk.Frame(parent)
+        buffer_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(buffer_frame, text="Buffer Size (MB):").pack(side=tk.LEFT, padx=(0, 10))
+        self.buffer_var = tk.IntVar(value=self.config['buffer_size'] // (1024*1024))
+        buffer_spin = ttk.Spinbox(buffer_frame, from_=1, to=128, textvariable=self.buffer_var, width=10)
+        buffer_spin.pack(side=tk.LEFT)
+        self.create_tooltip(buffer_spin, "Memory buffer size for file copying")
+
+    def setup_error_ui(self, parent):
+        """Error handling UI"""
+        retry_frame = ttk.Frame(parent)
+        retry_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(retry_frame, text="Max Retries:").pack(side=tk.LEFT, padx=(0, 10))
+        self.retry_var = tk.IntVar(value=self.config['max_retries'])
+        retry_spin = ttk.Spinbox(retry_frame, from_=0, to=10, textvariable=self.retry_var, width=5)
+        retry_spin.pack(side=tk.LEFT, padx=(0, 20))
+        
+        ttk.Label(retry_frame, text="Retry Delay (s):").pack(side=tk.LEFT, padx=(0, 10))
+        self.retry_delay_var = tk.IntVar(value=self.config['retry_delay'])
+        delay_spin = ttk.Spinbox(retry_frame, from_=1, to=30, textvariable=self.retry_delay_var, width=5)
+        delay_spin.pack(side=tk.LEFT)
+
+    def setup_validation_ui(self, parent):
+        """Validation settings UI"""
         self.signature_var = tk.BooleanVar(value=self.config['verify_signatures'])
-        ttk.Checkbutton(validation_frame, text="Verify PS3 file signatures", variable=self.signature_var).pack(anchor="w")
+        sig_cb = ttk.Checkbutton(parent, text="Verify PS3 file signatures", variable=self.signature_var)
+        sig_cb.pack(anchor=tk.W, pady=5)
+        self.create_tooltip(sig_cb, "Validate critical PS3 file signatures")
         
         self.backup_var = tk.BooleanVar(value=self.config['create_backup'])
-        ttk.Checkbutton(validation_frame, text="Create backup of existing files", variable=self.backup_var).pack(anchor="w")
-        
-        # Save/Load settings
-        settings_frame = ttk.Frame(adv_frame)
-        settings_frame.pack(fill=tk.X, pady=20)
-        
-        ttk.Button(settings_frame, text="Save Settings", command=self.save_settings).pack(side="left", padx=5)
-        ttk.Button(settings_frame, text="Reset to Defaults", command=self.reset_settings).pack(side="left", padx=5)
+        backup_cb = ttk.Checkbutton(parent, text="Create backup of existing files", variable=self.backup_var)
+        backup_cb.pack(anchor=tk.W, pady=5)
+        self.create_tooltip(backup_cb, "Backup existing files before overwriting")
+
+    def setup_save_ui(self, parent):
+        """Save settings UI"""
+        ttk.Button(parent, text="Save Settings", command=self.save_settings, width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(parent, text="Reset to Defaults", command=self.reset_settings, width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(parent, text="Close", command=self.hide_settings, width=10).pack(side=tk.RIGHT, padx=5)
 
     def setup_log_tab(self):
-        log_frame = ttk.Frame(self.log_frame, padding=10)
-        log_frame.pack(fill=tk.BOTH, expand=True)
+        """Modern log display tab"""
+        self.log_frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(self.log_frame, text="Log")
+        
+        log_container = ttk.Frame(self.log_frame)
+        log_container.pack(fill=tk.BOTH, expand=True)
         
         # Log text widget with scrollbar
-        self.log_text = tk.Text(log_frame, height=25, wrap=tk.WORD)
-        log_scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=log_scroll.set)
+        self.log_text = scrolledtext.ScrolledText(log_container, height=25, wrap=tk.WORD)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+        self.log_text.config(state=tk.DISABLED)
+
+    def create_tooltip(self, widget, text):
+        """Create tooltip for widgets"""
+        tooltip = tk.Toplevel(widget)
+        tooltip.wm_overrideredirect(True)
+        tooltip.wm_withdraw()
         
-        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        label = ttk.Label(tooltip, text=text, background="#ffffe0", relief=tk.SOLID, borderwidth=1)
+        label.pack(ipadx=1)
+        
+        def enter(event):
+            x = widget.winfo_rootx() + widget.winfo_width() + 5
+            y = widget.winfo_rooty()
+            tooltip.wm_geometry(f"+{x}+{y}")
+            tooltip.wm_deiconify()
+        
+        def leave(event):
+            tooltip.wm_withdraw()
+        
+        widget.bind("<Enter>", enter)
+        widget.bind("<Leave>", leave)
 
     def save_settings(self):
         """Save current settings to config"""
@@ -314,20 +422,26 @@ class PS3GameCopier:
             'create_backup': False,
             'show_advanced': False
         }
-        self.update_advanced_ui()
-        messagebox.showinfo("Settings", "Settings reset to defaults!")
-
-    def update_advanced_ui(self):
-        """Update advanced tab UI with current settings"""
         self.buffer_var.set(self.config['buffer_size'] // (1024*1024))
         self.retry_var.set(self.config['max_retries'])
         self.retry_delay_var.set(self.config['retry_delay'])
         self.signature_var.set(self.config['verify_signatures'])
         self.backup_var.set(self.config['create_backup'])
+        messagebox.showinfo("Settings", "Settings reset to defaults!")
+
+    def show_settings(self):
+        """Show advanced settings tab"""
+        self.notebook.select(self.advanced_frame)
+
+    def hide_settings(self):
+        """Hide advanced settings tab"""
+        self.notebook.select(self.main_frame)
 
     def clear_log(self):
         """Clear the log display"""
+        self.log_text.config(state=tk.NORMAL)
         self.log_text.delete(1.0, tk.END)
+        self.log_text.config(state=tk.DISABLED)
 
     def log_to_ui(self, message: str, level: str = "INFO"):
         """Add message to UI log"""
@@ -335,8 +449,10 @@ class PS3GameCopier:
         formatted_msg = f"[{timestamp}] {level}: {message}\n"
         
         def update_log():
+            self.log_text.config(state=tk.NORMAL)
             self.log_text.insert(tk.END, formatted_msg)
             self.log_text.see(tk.END)
+            self.log_text.config(state=tk.DISABLED)
         
         self.gui_queue.put(update_log)
 
@@ -418,6 +534,8 @@ class PS3GameCopier:
             return "Disc Image"
         elif (folder / "PS3_GAME" / "PARAM.SFO").exists():
             return "Folder Game"
+        elif (folder / "USRDIR").exists() and (folder / "EBOOT.BIN").exists():
+            return "PSN Game"
         else:
             return "Unknown"
 
@@ -454,8 +572,38 @@ class PS3GameCopier:
         # Enhanced FAT32 validation
         if not self.validate_fat32_destination():
             return False
+            
+        # Check for large files if splitting is disabled
+        if not self.split_var.get():
+            large_files = self.check_for_large_files()
+            if large_files:
+                msg = (f"Found {len(large_files)} files that exceed the 4GB FAT32 limit but splitting is disabled!\n"
+                       "These files cannot be copied without splitting.\n\n"
+                       "First few files:\n" + "\n".join(large_files[:5]))
+                if len(large_files) > 5:
+                    msg += f"\n...and {len(large_files)-5} more"
+                messagebox.showwarning("Large Files Detected", msg)
+                return False
                 
         return True
+
+    def check_for_large_files(self) -> List[str]:
+        """Return list of files >4GB in source"""
+        large_files = []
+        for game_folder in self.scan_source():
+            if not self.is_valid_ps3_folder(game_folder):
+                continue
+                
+            for file_path in game_folder.rglob('*'):
+                if file_path.is_file():
+                    try:
+                        if file_path.stat().st_size > FAT32_LIMIT:
+                            rel_path = file_path.relative_to(self.source)
+                            large_files.append(str(rel_path))
+                    except (OSError, IOError) as e:
+                        self.log_to_ui(f"Could not check size for {file_path}: {e}", "WARNING")
+                        continue
+        return large_files
 
     def validate_fat32_destination(self) -> bool:
         """Enhanced FAT32 validation"""
@@ -609,11 +757,19 @@ class PS3GameCopier:
 
     def is_valid_ps3_folder(self, folder: Path) -> bool:
         """Enhanced PS3 folder validation with signature checking"""
-        # Basic file existence check
-        has_disc_sfb = (folder / "PS3_DISC.SFB").exists()
-        has_param_sfo = (folder / "PS3_GAME" / "PARAM.SFO").exists() or (folder / "PARAM.SFO").exists()
+        # Check for common PS3 game structures
+        valid_structures = [
+            # Disc game structure
+            lambda f: (f/"PS3_DISC.SFB").exists() and (f/"PS3_GAME"/"PARAM.SFO").exists(),
+            # Folder game structure (common for digital games)
+            lambda f: (f/"PARAM.SFO").exists(),
+            # Digital download structure (common for PSN games)
+            lambda f: (f/"EBOOT.BIN").exists() and (f/"USRDIR").exists(),
+            # Minimal valid structure: at least one SFO file or an EBOOT.BIN
+            lambda f: any(f.glob("*.SFO")) or any(f.glob("EBOOT.BIN"))
+        ]
         
-        if not (has_disc_sfb or has_param_sfo):
+        if not any(check(folder) for check in valid_structures):
             return False
         
         # Optional signature validation
@@ -964,7 +1120,9 @@ class PS3GameCopier:
             ('PARAM.SFO', folder),
             ('PARAM.SFO', folder / 'PS3_GAME'),
             ('ICON0.PNG', folder),
-            ('ICON0.PNG', folder / 'PS3_GAME')
+            ('ICON0.PNG', folder / 'PS3_GAME'),
+            ('EBOOT.BIN', folder / 'PS3_GAME'),
+            ('EBOOT.BIN', folder)
         ]
         
         for filename, location in essential_files:
@@ -980,10 +1138,12 @@ class PS3GameCopier:
                     except Exception as e:
                         self.log_to_ui(f"Could not verify signature for {filename}: {e}", "WARNING")
             else:
-                missing_files.append(str(location.relative_to(folder) / filename))
+                # Only report missing if it's a critical file
+                if filename in ['PARAM.SFO', 'PS3_DISC.SFB', 'EBOOT.BIN']:
+                    missing_files.append(str(location.relative_to(folder) / filename))
         
         if missing_files:
-            self.log_to_ui(f"Missing PS3 files in {folder.name}: {', '.join(missing_files)}", "WARNING")
+            self.log_to_ui(f"Missing critical PS3 files in {folder.name}: {', '.join(missing_files)}", "WARNING")
         
         if corrupted_files:
             self.log_to_ui(f"Corrupted PS3 files in {folder.name}: {', '.join(corrupted_files)}", "ERROR")
@@ -1059,6 +1219,7 @@ class PS3GameCopier:
             elapsed = time.time() - self.stats['start_time']
             if elapsed > 0:
                 speed = self.stats['bytes_copied'] / elapsed
+                self.speed_var.set(f"{self.format_size(speed)}/s")
                 
                 # Estimate remaining time
                 remaining_files = self.stats['total_files'] - self.stats['copied'] - self.stats['skipped'] - self.stats['failed']
@@ -1066,14 +1227,11 @@ class PS3GameCopier:
                 
                 if speed > 0 and remaining_bytes > 0:
                     eta_seconds = remaining_bytes / speed
-                    eta = timedelta(seconds=int(eta_seconds))
+                    self.eta_var.set(str(timedelta(seconds=int(eta_seconds))))
                 else:
-                    eta = "Calculating..."
+                    self.eta_var.set("--:--:--")
                 
-                self.status_var.set(
-                    f"Status: Copying... | Speed: {self.format_size(speed)}/s | "
-                    f"ETA: {eta} | Data: {self.format_size(self.stats['bytes_copied'])}/{self.format_size(self.stats['total_size'])}"
-                )
+                self.copied_var.set(f"{self.format_size(self.stats['bytes_copied'])}/{self.format_size(self.stats['total_size'])}")
         
         self.gui_queue.put(update)
 
@@ -1283,7 +1441,7 @@ def main():
         height = root.winfo_height()
         x = (root.winfo_screenwidth() // 2) - (width // 2)
         y = (root.winfo_screenheight() // 2) - (height // 2)
-        root.geometry(f"{width}x{height}+{x}+{y}")
+        root.geometry(f"+{x}+{y}")
         
         # Start the application
         logging.info("PS3 Game Copier Enhanced Edition started")
