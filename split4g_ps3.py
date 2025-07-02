@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PS3 FAT32 Transfer Tool PRO - Enhanced Edition v2.0
+PS3 FAT32 Transfer Tool PRO - Enhanced Edition v2.1
 Advanced file management tool with robust path handling and error diagnostics
 Includes: Path validation, character sanitization, antivirus handling, and FAT32 compliance
 """
@@ -925,7 +925,7 @@ class PS3TransferGUI:
     
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("PS3 FAT32 Transfer Tool PRO - Enhanced Edition v2.0")
+        self.root.title("PS3 FAT32 Transfer Tool PRO - Enhanced Edition v2.1")
         self.root.geometry("1100x750")
         self.root.resizable(True, True)
         
@@ -1020,7 +1020,7 @@ class PS3TransferGUI:
         tab.rowconfigure(5, weight=1)
         
         # Title
-        title_label = ttk.Label(tab, text="PS3 FAT32 Transfer Tool PRO - Enhanced Edition v2.0", style='Title.TLabel')
+        title_label = ttk.Label(tab, text="PS3 FAT32 Transfer Tool PRO - Enhanced Edition v2.1", style='Title.TLabel')
         title_label.grid(row=0, column=0, columnspan=4, pady=(0, 15))
         
         # Source directory selection
@@ -1287,9 +1287,10 @@ class PS3TransferGUI:
                     warnings = len(game_info['warning_files'])
                     total_warnings += warnings
                     
+                    # Insert with proper column values
                     self.root.after(0, self.game_list_main.insert, '', 'end', 
                                   text=game_info['name'], 
-                                  values=(f"{size_gb:.2f}", status, warnings))
+                                  values=(f"{size_gb:.2f} GB", status, warnings))
                     
                     total_size += game_info['size']
                 except Exception as e:
