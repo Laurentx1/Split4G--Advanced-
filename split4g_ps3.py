@@ -2310,57 +2310,74 @@ class PS3TransferGUI:
         """Show detailed error guide"""
         guide = """⚠️ Transfer Error – Possible Causes and Recommended Solutions
 
-1. ❗ Invalid File Name or Unsupported Characters
-   - Files may contain special characters (#, @, !, (), ,)
-   - Files may have excessive spaces or symbols
+1. ❗ File Naming Issues
+   - Files contain special characters (#, @, !, (), ,) that FAT32 doesn't support
+   - File names have spaces or symbols that cause transfer failures
+   - Our software may fail to automatically sanitize problematic names
 
    ✅ Solutions:
-   - Rename problematic files to simpler names
-   - Use only letters, numbers, and underscores
+   - Let our tool auto-rename files using its sanitization feature
+   - Manually rename files to use only letters, numbers and underscores
    - Avoid spaces and parentheses in file names
+   - If auto-rename fails, check the "Debugger" tab for error details
 
-2. ❗ Path Too Long (Windows MAX_PATH Limit)
-   - Windows limits paths to 260 characters
-   - Deeply nested folders often cause this
-
-   ✅ Solutions:
-   - Shorten folder names in source/destination
-   - Move game folder closer to drive root (e.g., D:\\Games\\)
-   - Enable long path support via Tools menu
-
-3. ❗ FAT32 File System Limitations
-   - FAT32 doesn't support files larger than 4GB
-   - Some directory structures cause issues
+2. ❗ Path Length Limitations
+   - Windows restricts file paths to 260 characters by default
+   - Deeply nested game folders often exceed this limit
+   - Our path shortening feature might fail in complex cases
 
    ✅ Solutions:
-   - Ensure files >4GB are split automatically
-   - Test transfer on NTFS-formatted drive
-   - Use our path validation tool
+   - Use the "Enable Long Path Support" tool in our software
+   - Shorten folder names in source/destination paths
+   - Move game folder closer to drive root (e.g., D:\Games\)
+   - Check debug logs for specific path truncation warnings
 
-4. ❗ Antivirus Interference
-   - Security software may block game files
-   - Real-time scanning can interrupt transfers
+3. ❗ FAT32 Filesystem Restrictions
+   - FAT32 can't handle files larger than 4GB
+   - Certain directory structures cause transfer failures
+   - Our file splitting feature might fail on some systems
+
+   ✅ Solutions:
+   - Verify file splitting worked in the transfer logs
+   - Test transfer on NTFS-formatted drive instead
+   - Use our "Validate Paths" tool before transferring
+   - Manually split oversized files if automatic splitting fails
+
+4. ❗ Security Software Conflicts
+   - Antivirus may quarantine game files during transfer
+   - Real-time scanning can interrupt file operations
+   - Our process might get blocked without notification
 
    ✅ Solutions:
    - Temporarily disable antivirus during transfer
-   - Whitelist this application in security settings
+   - Whitelist our application in security settings
    - Add game folder to antivirus exclusions
+   - Check antivirus quarantine for missing files
 
-5. ❗ File System Metadata Limitations
-   - Some file systems have limitations on:
-     * File names containing certain reserved words (CON, PRN, AUX, NUL)
-     * Files with specific metadata attributes
+5. ❗ System-Level File Restrictions
+   - Windows blocks reserved names (CON, PRN, AUX, NUL)
+   - File metadata attributes can cause transfer failures
+   - Our attribute handling might fail on some filesystems
 
    ✅ Solutions:
-   - Rename file to avoid reserved names
-   - Check filesystem for corruption (run CHKDSK on Windows)
+   - Our tool automatically renames reserved names - check logs
+   - Run CHKDSK to fix filesystem corruption
    - Try transferring to a different drive
+   - Use "Auto-Fix Attributes" tool in Debugger tab
 
-🛠️ Additional Recommendations:
-- Use the integrated debugger tool to detect issues
-- Try manually copying the problematic file
-- Check error diagnostics tab for specific file issues
-- Consult logs for detailed error information"""
+🛠️ Software-Specific Troubleshooting:
+- If our tool fails unexpectedly:
+  1. Check the "Error Diagnostics" tab for specific solutions
+  2. View detailed logs in the "Logs" tab
+  3. Run the "Pre-Transfer Debugger" to detect issues
+  4. Try the "Validate Paths" tool before retrying
+  5. Check for updates - we constantly improve compatibility
+
+- For persistent issues:
+  1. Click "View Manifest" to verify file records
+  2. Use "Copy Error Details" to share with support
+  3. Try manual transfer of problematic files as a test
+  4. Consult our online error database using the error code"""
         
         messagebox.showinfo("Transfer Error Guide", guide)
     
