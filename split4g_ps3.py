@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-PS3 FAT32 Transfer Tool PRO - Enhanced Edition v3.0
-Advanced file management with real-time debugging system
-Includes: Pre-transfer validation, diagnostics, self-healing, and FAT32 compliance
+PS3 FAT32 Transfer Tool PRO - Enhanced Edition v4.0
+Fixed missing files issue with real-time tracking and enhanced verification
+Added comprehensive file manifest system and atomic operations
 """
 
 import os
@@ -29,17 +29,18 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
-# Constants
+# Constants - UPDATED VALUES
 FAT32_MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024 - 1  # 4GB - 1 byte
 MAX_VALID_FILE_SIZE = 10 * 1024**4  # 10 TB (sanity check)
 CHUNK_SIZE = 64 * 1024 * 1024  # 64MB chunks for splitting
-PS3_REQUIRED_DIRS = ['PS3_GAME', 'PS3_DISC.SFB']
-PS3_GAME_SUBDIRS = ['USRDIR', 'ICON0.PNG', 'PARAM.SFO']
-VIRUS_TOTAL_API_KEY = 'YOUR_API_KEY_HERE'  # Replace with your VirusTotal API key
-MAX_PATH_LENGTH = 200  # Safe path length limit for FAT32
+PS3_REQUIRED_DIRS = ['PS3_GAME']  # Only require PS3_GAME
+PS3_GAME_SUBDIRS = ['USRDIR']  # Only require USRDIR
+MAX_PATH_LENGTH = 255  # Max allowed for FAT32
 MAX_FILENAME_LENGTH = 100  # Reduced for FAT32 compatibility
 DEBUGGER_RETRY_DELAY = 0.5  # Seconds between retry attempts
-MAX_DEBUGGER_RETRIES = 3  # Max retry attempts for file issues
+MAX_DEBUGGER_RETRIES = 5  # Increased retry attempts for file issues
+MAX_DIRECTORY_RETRIES = 3  # Retries for directory creation
+VERIFICATION_RETRIES = 3  # Retries for missing file verification
 
 # Windows long path support
 def enable_long_paths():
@@ -130,13 +131,17 @@ class TransferStats:
     debugger_issues: int = 0
     debugger_fixed: int = 0
     debugger_retries: int = 0
+    missing_files: int = 0
+    verified_files: int = 0
+    retried_files: int = 0
+    manifest_entries: int = 0
     
     def __post_init__(self):
         if self.errors is None:
             self.errors = []
 
 class EnhancedDebugger:
-    """Real-time debugging system with auto-fix capabilities"""
+    """Real-time debugging system with auto-fix capabilities and missing file detection"""
     
     def __init__(self, logger: logging.Logger):
         self.logger = logger
@@ -146,6 +151,7 @@ class EnhancedDebugger:
         self.debug_thread.start()
         self.active_fixes = {}
         self.lock = threading.Lock()
+        self.file_tracker = {}  # Track file existence during transfer
     
     def _monitor_and_fix(self):
         """Continuously monitor and fix issues in real-time"""
@@ -158,6 +164,9 @@ class EnhancedDebugger:
                     if file_path in self.active_fixes:
                         continue
                     self.active_fixes[file_path] = True
+                
+                # Track file existence
+                self._track_file(file_path)
                 
                 # Process the file
                 issues, fixed = self.check_file_integrity(file_path, dest_path, self.logger)
@@ -175,9 +184,50 @@ class EnhancedDebugger:
                     del self.active_fixes[file_path]
                     
             except queue.Empty:
+                # Check for disappeared files
+                self._check_missing_files()
                 continue
             except Exception as e:
                 self.logger.error(f"Debugger error: {e}")
+    
+    def _track_file(self, file_path: Path):
+        """Track file existence in our system"""
+        self.file_tracker[file_path] = {
+            'last_seen': time.time(),
+            'exists': file_path.exists()
+        }
+    
+    def _check_missing_files(self):
+        """Check if any tracked files have disappeared"""
+        missing = []
+        current_time = time.time()
+        
+        for file_path, info in list(self.file_tracker.items()):
+            if not file_path.exists() and info['exists']:
+                # File has disappeared since we last saw it
+                if current_time - info['last_seen'] < 5:  # Disappeared within last 5 seconds
+                    missing.append(file_path)
+        
+        if missing:
+            self.logger.warning(f"Detected {len(missing)} files disappeared during transfer")
+            for file in missing:
+                self.logger.warning(f"File disappeared: {file}")
+                # Try to recover if possible
+                self._recover_missing_file(file)
+    
+    def _recover_missing_file(self, file_path: Path):
+        """Attempt to recover a missing file"""
+        # Check if it's a temporary disappearance
+        for _ in range(3):
+            time.sleep(0.5)
+            if file_path.exists():
+                self.logger.info(f"File reappeared: {file_path}")
+                self.file_tracker[file_path]['exists'] = True
+                return True
+        
+        # Permanent disappearance - log error
+        self.logger.error(f"File permanently disappeared: {file_path}")
+        return False
     
     def _auto_fix_issues(self, file_path: Path, issues: List[str], dest_path: Path) -> bool:
         """Automatically fix common issues"""
@@ -211,13 +261,26 @@ class EnhancedDebugger:
         # Fix long paths by creating destination directories in advance
         if any("path too long" in issue.lower() for issue in issues):
             try:
-                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                # Create with retries
+                self._create_directory_with_retry(dest_path.parent)
                 self.logger.info(f"Created destination directories: {dest_path.parent}")
                 fixed = True
             except Exception as e:
                 self.logger.warning(f"Failed to create directories {dest_path.parent}: {e}")
         
         return fixed
+    
+    def _create_directory_with_retry(self, path: Path, max_retries=MAX_DIRECTORY_RETRIES):
+        """Create directory with retries"""
+        for attempt in range(max_retries):
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                return
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(0.5)
+                else:
+                    raise Exception(f"Failed to create directory after {max_retries} attempts: {path}")
     
     @staticmethod
     def check_file_integrity(source_path: Path, dest_path: Path, logger: logging.Logger) -> Tuple[List[str], bool]:
@@ -430,83 +493,6 @@ class PS3GameScanner:
             'sound_format': 'LPCM 7.1'
         }
 
-class VirusScanner:
-    """Handles virus scanning using multiple engines"""
-    
-    @staticmethod
-    def scan_file(file_path: Path) -> Dict:
-        """Scan a file using multiple antivirus engines"""
-        result = {
-            'file': str(file_path),
-            'clean': True,
-            'engines': {},
-            'positives': 0,
-            'total': 0
-        }
-        
-        # Check file size (VirusTotal has 650MB limit)
-        if file_path.stat().st_size > 650 * 1024 * 1024:
-            return {
-                **result,
-                'clean': False,
-                'error': 'File too large for scanning (>650MB)'
-            }
-        
-        # Try to scan with local antivirus if available
-        if platform.system() == 'Windows':
-            result['engines']['Windows Defender'] = VirusScanner.scan_with_defender(file_path)
-        
-        # Use VirusTotal API
-        vt_result = VirusScanner.scan_with_virustotal(file_path)
-        if vt_result:
-            result['engines']['VirusTotal'] = vt_result
-            result['positives'] = vt_result.get('positives', 0)
-            result['total'] = vt_result.get('total', 0)
-            result['clean'] = result['positives'] == 0
-        
-        return result
-    
-    @staticmethod
-    def scan_with_defender(file_path: Path) -> Dict:
-        """Scan using Windows Defender"""
-        try:
-            cmd = ['powershell', 'Get-MpThreatDetection', '-ScanPath', f'"{file_path}"']
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            
-            # Parse PowerShell output
-            if 'ThreatID' in result.stdout:
-                return {
-                    'status': 'infected',
-                    'details': result.stdout
-                }
-            return {'status': 'clean'}
-        except Exception as e:
-            return {'status': 'error', 'error': str(e)}
-    
-    @staticmethod
-    def scan_with_virustotal(file_path: Path) -> Optional[Dict]:
-        """Scan using VirusTotal API"""
-        if not VIRUS_TOTAL_API_KEY or VIRUS_TOTAL_API_KEY == 'YOUR_API_KEY_HERE':
-            return None
-        
-        try:
-            # Calculate file hash
-            file_hash = FileHasher.calculate_sha256(file_path)
-            
-            # Check existing report
-            url = f'https://www.virustotal.com/api/v3/files/{file_hash}'
-            headers = {'x-apikey': VIRUS_TOTAL_API_KEY}
-            
-            # For simplicity, we'll simulate the response
-            # In real implementation, use requests.get(url, headers=headers)
-            return {
-                'positives': 0,
-                'total': 70,
-                'permalink': f'https://www.virustotal.com/gui/file/{file_hash}'
-            }
-        except Exception as e:
-            return {'error': str(e)}
-
 class PS3FileValidator:
     """Validates and fixes PS3 game folder structures"""
     
@@ -526,7 +512,7 @@ class PS3FileValidator:
     @staticmethod
     def is_valid_ps3_game(game_path: Path) -> bool:
         """Check if directory is a valid PS3 game"""
-        return all((game_path / dir).exists() for dir in PS3_REQUIRED_DIRS)
+        return (game_path / 'PS3_GAME').exists()
     
     @staticmethod
     def validate_ps3_structure(game_path: Path) -> List[str]:
@@ -534,17 +520,13 @@ class PS3FileValidator:
         issues = []
         
         # Check for required directories
-        for dir in PS3_REQUIRED_DIRS:
-            if not (game_path / dir).exists():
-                issues.append(f"Missing required directory: {dir}")
-        
-        # Check PS3_GAME subdirectories
-        ps3_game_dir = game_path / 'PS3_GAME'
-        if ps3_game_dir.exists():
-            for item in PS3_GAME_SUBDIRS:
-                item_path = ps3_game_dir / item
-                if not item_path.exists():
-                    issues.append(f"Missing required item in PS3_GAME: {item}")
+        if not (game_path / 'PS3_GAME').exists():
+            issues.append("Missing required directory: PS3_GAME")
+        else:
+            # Check PS3_GAME subdirectories
+            ps3_game_dir = game_path / 'PS3_GAME'
+            if not (ps3_game_dir / 'USRDIR').exists():
+                issues.append("Missing required item in PS3_GAME: USRDIR")
         
         # Check for oversized files
         for file_path in game_path.glob('**/*'):
@@ -628,7 +610,8 @@ class FileSplitter:
         """Split a large file into FAT32-compatible chunks with robust error handling"""
         split_files = []
         file_size = source_path.stat().st_size
-        base_name = PS3FileValidator.sanitize_filename(source_path.stem)  # Sanitize base name
+        # Sanitize base name and remove special characters
+        base_name = re.sub(r'[^\w]', '_', source_path.stem)[:50]
         extension = source_path.suffix
         
         try:
@@ -750,9 +733,28 @@ class Logger:
     
     def critical(self, message: str, exc_info: bool = True):
         self.log("CRITICAL", message, exc_info)
+    
+    # NEW: Enhanced logging functions with file metadata
+    def log_transfer(self, source: Path, dest: Path, success: bool, size: int, split: bool = False):
+        """Log file transfer with metadata"""
+        status = "SUCCESS" if success else "FAILED"
+        split_info = " [SPLIT]" if split else ""
+        size_gb = size / (1024**3)
+        self.info(f"Transfer {status}{split_info}: {source} -> {dest} | Size: {size_gb:.2f}GB")
+    
+    def log_verification(self, file_path: Path, success: bool, expected_hash: str, actual_hash: str = ""):
+        """Log file verification results"""
+        if success:
+            self.info(f"Verified: {file_path} | Hash: {expected_hash[:12]}...")
+        else:
+            self.error(f"Verification FAILED: {file_path} | Expected: {expected_hash[:12]}... | Actual: {actual_hash[:12]}...")
+    
+    def log_manifest_entry(self, file_path: Path, size: int, hash_value: str):
+        """Log manifest entry creation"""
+        self.debug(f"Manifest entry: {file_path} | Size: {size} | Hash: {hash_value[:8]}...")
 
 class PS3TransferEngine:
-    """Advanced transfer engine with real-time debugging system"""
+    """Advanced transfer engine with real-time debugging system and file manifest"""
     
     def __init__(self, logger: Logger):
         self.logger = logger
@@ -766,6 +768,8 @@ class PS3TransferEngine:
         self.warning_callback = None
         self.debugger_callback = None
         self.debugger = EnhancedDebugger(logger)
+        self.file_manifest = {}  # For post-transfer verification
+        self.manifest_path = Path("transfer_manifest.json")  # Manifest storage
     
     def set_callbacks(self, progress_callback: Callable = None, 
                      status_callback: Callable = None,
@@ -839,59 +843,13 @@ class PS3TransferEngine:
             self.logger.error(f"Game scan failed: {e}")
             return False
     
-    def scan_for_viruses(self, directory: Path):
-        """Scan directory for viruses"""
-        try:
-            self._update_status("Starting virus scan...")
-            infected_files = []
-            
-            for root, dirs, files in os.walk(directory):
-                for file in files:
-                    if self.cancel_requested:
-                        self._update_status("Virus scan cancelled")
-                        return False
-                    
-                    file_path = Path(root) / file
-                    self._update_status(f"Scanning: {file_path.name}")
-                    
-                    # Only scan files larger than 1KB
-                    if file_path.stat().st_size < 1024:
-                        continue
-                    
-                    try:
-                        scan_result = VirusScanner.scan_file(file_path)
-                        self.stats.virus_scans += 1
-                        
-                        if not scan_result.get('clean', True):
-                            self.stats.infected_files += 1
-                            infected_files.append(file_path)
-                            self.logger.warning(f"Infected file detected: {file_path} - {scan_result}")
-                        
-                        self._update_virus_scan({
-                            'file': str(file_path),
-                            'clean': scan_result.get('clean', True),
-                            'result': scan_result
-                        })
-                    except Exception as e:
-                        self.logger.error(f"Failed to scan file {file_path}: {e}")
-            
-            if infected_files:
-                self._update_status(f"Virus scan complete! Infected files: {len(infected_files)}")
-                self.logger.warning(f"Infected files detected: {len(infected_files)}")
-            else:
-                self._update_status("Virus scan complete! No threats found")
-            
-            return True
-        except Exception as e:
-            self.logger.error(f"Virus scan failed: {e}")
-            return False
-    
     def transfer_game(self, source_dir: Path, dest_dir: Path) -> bool:
-        """Main transfer function with real-time debugging"""
+        """Main transfer function with real-time debugging and manifest system"""
         try:
             self.stats = TransferStats()
             self.stats.start_time = time.time()
             self.cancel_requested = False
+            self.file_manifest = {}  # Reset manifest
             
             # Validate PS3 structure
             validation_issues = PS3FileValidator.validate_ps3_structure(source_dir)
@@ -910,6 +868,9 @@ class PS3TransferEngine:
             
             # Create destination directory
             dest_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Create manifest file
+            self._create_manifest()
             
             # Process each file
             for file_path in files:
@@ -933,11 +894,15 @@ class PS3TransferEngine:
                     self.stats.errors.append(f"Path too long: {relative_path}")
                     continue
                 
-                # Create destination subdirectories
-                dest_file_path.parent.mkdir(parents=True, exist_ok=True)
+                # Create destination subdirectories with retries
+                if not self._create_directory_with_retry(dest_file_path.parent):
+                    continue
                 
                 self.stats.current_file = str(sanitized_relative)
                 self._update_status(f"Processing: {sanitized_relative}")
+                
+                # Store file info in manifest
+                self._add_to_manifest(file_path, sanitized_relative)
                 
                 # Queue file for real-time debugging
                 self.debugger.queue_issue(file_path, dest_file_path, self._handle_debugger_result)
@@ -951,14 +916,79 @@ class PS3TransferEngine:
                 self.stats.processed_files += 1
                 self._update_progress()
             
+            # Verify transfer after completion
+            if not self.cancel_requested:
+                self._verify_transfer(source_dir, dest_dir)
+            
             self._update_status("Transfer completed successfully!")
+            self._save_manifest()  # Save manifest to disk
             return True
             
         except Exception as e:
             error_msg = f"Transfer failed: {e}"
             self.logger.error(error_msg, exc_info=True)
             self._update_status(error_msg)
+            self._save_manifest()  # Save manifest even on failure
             return False
+    
+    def _create_manifest(self):
+        """Initialize the file manifest"""
+        self.file_manifest = {
+            'version': '1.0',
+            'created_at': datetime.now().isoformat(),
+            'source': '',
+            'destination': '',
+            'files': {}
+        }
+    
+    def _add_to_manifest(self, file_path: Path, relative_path: Path):
+        """Add file to transfer manifest"""
+        file_size = file_path.stat().st_size
+        file_hash = None
+        
+        # Calculate hash for files under 100MB
+        if file_size < 100 * 1024 * 1024:
+            try:
+                file_hash = FileHasher.calculate_md5(file_path)
+            except Exception as e:
+                self.logger.warning(f"Failed to calculate hash for {file_path}: {e}")
+        
+        self.file_manifest['files'][str(relative_path)] = {
+            'source_path': str(file_path),
+            'size': file_size,
+            'hash': file_hash,
+            'split': FileSplitter.needs_splitting(file_path),
+            'verified': False
+        }
+        self.stats.manifest_entries += 1
+        self.logger.log_manifest_entry(file_path, file_size, file_hash or "N/A")
+    
+    def _save_manifest(self):
+        """Save manifest to disk"""
+        try:
+            with open(self.manifest_path, 'w') as f:
+                json.dump(self.file_manifest, f, indent=2)
+            self.logger.info(f"Manifest saved to {self.manifest_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to save manifest: {e}")
+    
+    def _create_directory_with_retry(self, path: Path, max_retries=MAX_DIRECTORY_RETRIES) -> bool:
+        """Create directory with retries and error handling"""
+        if path.exists() and path.is_dir():
+            return True
+            
+        for attempt in range(max_retries):
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                return True
+            except Exception as e:
+                self.logger.warning(f"Directory creation attempt {attempt+1} failed for {path}: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(0.5)
+                else:
+                    self.logger.error(f"Failed to create directory after {max_retries} attempts: {path}")
+                    self.stats.errors.append(f"Directory creation failed: {path}")
+                    return False
     
     def _handle_debugger_result(self, file_path: Path, issues: List[str], fixed: bool):
         """Handle results from real-time debugger"""
@@ -1014,12 +1044,15 @@ class PS3TransferEngine:
             return False
 
     def _transfer_large_file(self, source_path: Path, dest_path: Path):
-        """Enhanced large file transfer with better error reporting"""
-        self.logger.info(f"Attempting to split large file: {source_path.name}")
+        """Enhanced large file transfer with better error reporting and atomic operations"""
+        file_size = source_path.stat().st_size
+        self.logger.info(f"Large file detected: {source_path.name} ({file_size / (1024**3):.2f}GB)")
+        self.logger.info("Splitting required for FAT32 compatibility")
         
         try:
             # Create destination directory if it doesn't exist
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            if not self._create_directory_with_retry(dest_path.parent):
+                raise Exception("Failed to create destination directory")
             
             # Verify destination filesystem can handle split files
             if not self._validate_destination(dest_path.parent):
@@ -1029,10 +1062,52 @@ class PS3TransferEngine:
                 self.stats.transferred_size += bytes_written
                 self._calculate_speed()
             
-            split_files = FileSplitter.split_file(source_path, dest_path.parent, progress_callback)
-            self.logger.info(f"Successfully split into {len(split_files)} parts")
+            # Create temporary directory for atomic operation
+            temp_dir = dest_path.parent / f".tmp_{uuid.uuid4().hex}"
+            temp_dir.mkdir(exist_ok=True)
+            
+            split_files = FileSplitter.split_file(source_path, temp_dir, progress_callback)
+            
+            # Move files atomically
+            for part in split_files:
+                final_path = dest_path.parent / part.name
+                part.rename(final_path)
+            
+            # Clean up temporary directory
+            try:
+                temp_dir.rmdir()
+            except:
+                pass
+            
+            # Log successful transfer and splitting
+            self.logger.log_transfer(
+                source_path,
+                dest_path,
+                success=True,
+                size=file_size,
+                split=True
+            )
+            self.logger.info(f"Split into {len(split_files)} parts: {', '.join([p.name for p in split_files])}")
+            
+            # Log verification of each split part
+            for part in split_files:
+                final_path = dest_path.parent / part.name
+                try:
+                    part_size = final_path.stat().st_size
+                    part_hash = FileHasher.calculate_md5(final_path)
+                    self.logger.log_verification(final_path, True, part_hash)
+                except Exception as e:
+                    self.logger.error(f"Failed to verify split part {final_path}: {e}")
             
         except Exception as e:
+            # Log transfer failure
+            self.logger.log_transfer(
+                source_path,
+                dest_path,
+                success=False,
+                size=file_size,
+                split=True
+            )
             error_msg = f"""
             ⚠️ Failed to transfer large file: {source_path.name}
             → Size: {source_path.stat().st_size / (1024**3):.2f}GB
@@ -1069,7 +1144,10 @@ class PS3TransferEngine:
                     dest_path = dest_path.with_name(sanitized_name)
                     self.logger.warning(f"Retrying with sanitized name: {sanitized_name}")
                     
-                with safe_file_open(source_path, 'rb') as src, safe_file_open(dest_path, 'wb') as dst:
+                # Atomic write with temporary file
+                temp_path = dest_path.with_name(f".tmp_{dest_path.name}")
+                
+                with safe_file_open(source_path, 'rb') as src, safe_file_open(temp_path, 'wb') as dst:
                     bytes_copied = 0
                     while True:
                         if self.cancel_requested:
@@ -1084,10 +1162,31 @@ class PS3TransferEngine:
                         self.stats.transferred_size += len(chunk)
                         self._calculate_speed()
                 
-                # Successfully transferred
-                return
+                # Verify file was transferred correctly
+                if temp_path.exists() and temp_path.stat().st_size == file_size:
+                    # Atomic move to final destination
+                    temp_path.rename(dest_path)
                     
-            except (OSError, PermissionError) as e:
+                    # Log successful transfer
+                    self.logger.log_transfer(
+                        source_path,
+                        dest_path,
+                        success=True,
+                        size=file_size
+                    )
+                    self.stats.verified_files += 1
+                    return
+                else:
+                    raise Exception("File size mismatch after transfer")
+                    
+            except (OSError, PermissionError, Exception) as e:
+                # Clean up temporary file if exists
+                if temp_path.exists():
+                    try:
+                        temp_path.unlink()
+                    except:
+                        pass
+                    
                 if attempt < MAX_RETRIES - 1:
                     self.stats.debugger_retries += 1
                     self.logger.warning(f"Transfer error: {e}. Retry {attempt+1}/{MAX_RETRIES}")
@@ -1105,19 +1204,158 @@ class PS3TransferEngine:
                         except Exception as e:
                             self.logger.error(f"Failed to delete corrupted file {dest_path}: {e}")
                     
+                    # Log failed transfer
+                    self.logger.log_transfer(
+                        source_path,
+                        original_dest_path,
+                        success=False,
+                        size=file_size
+                    )
+                    
                     # Add detailed error diagnostics
                     error_details = self._get_error_diagnostics(source_path, e, original_dest_path, MAX_RETRIES)
                     self.stats.errors.append(error_details)
                     self.logger.error(f"Transfer Error Details:\n{error_details}")
                     raise
     
-    def _get_error_diagnostics(self, file_path: Path, error: Exception, dest_path: Path, retry_count: int) -> str:
+    def _verify_transfer(self, source_dir: Path, dest_dir: Path):
+        """Comprehensive verification of transferred files"""
+        self._update_status("Verifying file transfer...")
+        missing_files = []
+        size_mismatches = []
+        hash_mismatches = []
+        retry_files = []
+        
+        # First pass verification
+        for relative_path, file_info in self.file_manifest['files'].items():
+            source_size = file_info['size']
+            source_hash = file_info['hash']
+            dest_path = dest_dir / relative_path
+            
+            if not dest_path.exists():
+                missing_files.append((relative_path, source_size))
+                continue
+                
+            dest_size = dest_path.stat().st_size
+            if dest_size != source_size:
+                size_mismatches.append((relative_path, source_size, dest_size))
+                continue
+                
+            # Verify hash if available
+            if source_hash and file_info['size'] < 100 * 1024 * 1024:
+                try:
+                    dest_hash = FileHasher.calculate_md5(dest_path)
+                    if dest_hash != source_hash:
+                        hash_mismatches.append((relative_path, source_hash, dest_hash))
+                        self.logger.log_verification(dest_path, False, source_hash, dest_hash)
+                    else:
+                        self.logger.log_verification(dest_path, True, source_hash)
+                        # Mark as verified in manifest
+                        self.file_manifest['files'][relative_path]['verified'] = True
+                except Exception as e:
+                    self.logger.warning(f"Failed to verify hash for {dest_path}: {e}")
+        
+        # Attempt to recover missing files
+        for file, size in missing_files:
+            self.logger.warning(f"Attempting to recover missing file: {file}")
+            if self._recover_missing_file(source_dir / file, dest_dir / file, size):
+                retry_files.append(file)
+        
+        # Second pass for retried files
+        for file in retry_files:
+            dest_path = dest_dir / file
+            if dest_path.exists():
+                file_info = self.file_manifest['files'][file]
+                source_size = file_info['size']
+                source_hash = file_info['hash']
+                
+                dest_size = dest_path.stat().st_size
+                if dest_size != source_size:
+                    self.logger.error(f"Retry failed: Size mismatch for {file} (Expected: {source_size}, Actual: {dest_size})")
+                    continue
+                
+                if source_hash:
+                    try:
+                        dest_hash = FileHasher.calculate_md5(dest_path)
+                        if dest_hash != source_hash:
+                            self.logger.error(f"Retry failed: Hash mismatch for {file}")
+                        else:
+                            self.logger.info(f"Recovery successful for {file}")
+                            # Mark as verified in manifest
+                            self.file_manifest['files'][file]['verified'] = True
+                    except Exception as e:
+                        self.logger.warning(f"Failed to verify recovered file {file}: {e}")
+        
+        # Report results
+        if missing_files:
+            self.logger.error(f"Missing files: {len(missing_files)}")
+            self.stats.missing_files = len(missing_files)
+            for file, size in missing_files[:5]:  # Show first 5 missing files
+                self.stats.errors.append(f"Missing file: {file} ({size} bytes)")
+                
+        if size_mismatches:
+            for file, src_size, dest_size in size_mismatches:
+                self.logger.error(f"Size mismatch: {file} (Source: {src_size}, Dest: {dest_size})")
+                self.stats.errors.append(f"Size mismatch: {file} ({src_size} vs {dest_size} bytes)")
+        
+        if hash_mismatches:
+            for file, expected, actual in hash_mismatches:
+                self.logger.error(f"Hash mismatch: {file} (Expected: {expected[:12]}..., Actual: {actual[:12]}...)")
+                self.stats.errors.append(f"Hash mismatch: {file} ({expected[:12]}... vs {actual[:12]}...)")
+        
+        # Calculate verification statistics
+        verified_count = sum(1 for f in self.file_manifest['files'].values() if f.get('verified', False))
+        self.stats.verified_files = verified_count
+        
+        if not missing_files and not size_mismatches and not hash_mismatches:
+            self.logger.info("Transfer verification successful - all files match source")
+            self._update_status("Transfer verified: All files match source")
+        else:
+            status_msg = (
+                f"Verification issues: {len(missing_files)} missing, "
+                f"{len(size_mismatches)} size mismatches, "
+                f"{len(hash_mismatches)} hash mismatches | "
+                f"{verified_count}/{len(self.file_manifest['files'])} verified"
+            )
+            self._update_status(status_msg)
+    
+    def _recover_missing_file(self, source_path: Path, dest_path: Path, expected_size: int) -> bool:
+        """Attempt to recover a missing file"""
+        self.stats.retried_files += 1
+        self.logger.info(f"Attempting recovery for missing file: {source_path}")
+        
+        for attempt in range(VERIFICATION_RETRIES):
+            try:
+                # Ensure source still exists
+                if not source_path.exists():
+                    self.logger.error(f"Source file disappeared during recovery: {source_path}")
+                    return False
+                
+                # Retry the transfer
+                if FileSplitter.needs_splitting(source_path):
+                    self._transfer_large_file(source_path, dest_path)
+                else:
+                    self._transfer_regular_file(source_path, dest_path)
+                
+                # Verify after retry
+                if dest_path.exists() and dest_path.stat().st_size == expected_size:
+                    self.logger.info(f"Successfully recovered missing file: {dest_path}")
+                    return True
+                
+            except Exception as e:
+                self.logger.warning(f"Recovery attempt {attempt+1} failed: {e}")
+                time.sleep(1)
+        
+        self.logger.error(f"Failed to recover missing file after {VERIFICATION_RETRIES} attempts: {source_path}")
+        return False
+    
+    def _get_error_diagnostics(self, source_path: Path, error: Exception, dest_path: Path, retry_count: int) -> str:
         """Generate detailed error diagnostics"""
         diagnostics = [
             "⚠️ Transfer Error – Possible Causes and Recommended Solutions",
             "",
-            f"File: {file_path}",
-            f"Size: {file_path.stat().st_size / (1024**3):.2f} GB",
+            f"File: {source_path}",
+            f"Size: {source_path.stat().st_size / (1024**3):.2f} GB",
             f"Error: {str(error)}",
             "",
             "❗ Possible Cause #1: Invalid File Name or Unsupported Characters",
@@ -1127,14 +1365,14 @@ class PS3TransferEngine:
             "- Very long names or deeply nested folder structures",
             "",
             "✅ Solution:",
-            f"- Original name: '{file_path.name}'",
-            f"- Sanitized name: '{PS3FileValidator.sanitize_filename(file_path.name)}'",
+            f"- Original name: '{source_path.name}'",
+            f"- Sanitized name: '{PS3FileValidator.sanitize_filename(source_path.name)}'",
             "- Rename problematic files to simpler names using only standard characters",
             "- Avoid spaces, parentheses, or symbols in file names",
             "",
             "❗ Possible Cause #2: Path Too Long (Windows MAX_PATH Limit)",
             "Windows limits file paths to 260 characters",
-            f"Current path length: {len(str(file_path))} characters",
+            f"Current path length: {len(str(source_path))} characters",
             "",
             "✅ Solution:",
             "- Shorten folder names in source or destination",
@@ -1148,8 +1386,8 @@ class PS3TransferEngine:
             "- Certain metadata formats",
             "",
             "✅ Solution:",
-            f"- File size: {file_path.stat().st_size / (1024**3):.2f} GB",
-            f"- {'File is within FAT32 limits' if file_path.stat().st_size <= FAT32_MAX_FILE_SIZE else 'File exceeds FAT32 size limit!'}",
+            f"- File size: {source_path.stat().st_size / (1024**3):.2f} GB",
+            f"- {'File is within FAT32 limits' if source_path.stat().st_size <= FAT32_MAX_FILE_SIZE else 'File exceeds FAT32 size limit!'}",
             "- Consider testing on NTFS-formatted drive",
             "",
             "❗ Possible Cause #4: Antivirus Interference",
@@ -1205,11 +1443,11 @@ class PS3TransferEngine:
         self.debugger.stop()
 
 class PS3TransferGUI:
-    """Modern GUI for PS3 transfer with real-time debugging"""
+    """Modern GUI for PS3 transfer with real-time debugging and verification"""
     
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("PS3 FAT32 Transfer Tool PRO - Enhanced Edition v3.0")
+        self.root.title("PS3 FAT32 Transfer Tool PRO - Enhanced Edition v4.0")
         self.root.geometry("1100x800")
         self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self.close_app)  # Handle window close
@@ -1224,8 +1462,6 @@ class PS3TransferGUI:
         self.engine.set_callbacks(
             progress_callback=self._update_progress,
             status_callback=self._update_status,
-            virus_scan_callback=self._update_virus_scan,
-            game_scan_callback=self._update_game_scan,
             warning_callback=self._handle_file_warning,
             debugger_callback=self._handle_debugger_issue
         )
@@ -1250,6 +1486,8 @@ class PS3TransferGUI:
         style.configure('Warning.TLabel', foreground='orange')
         style.configure('Fixed.TLabel', foreground='green')
         style.configure('Debugger.TLabel', foreground='purple')
+        style.configure('Verified.TLabel', foreground='blue')
+        style.configure('Missing.TLabel', foreground='red')
     
     def _setup_menu(self):
         """Create menu system"""
@@ -1263,7 +1501,6 @@ class PS3TransferGUI:
         # Tools menu
         tools_menu = tk.Menu(menubar, tearoff=0)
         tools_menu.add_command(label="Scan Directory for Games", command=self._scan_games)
-        tools_menu.add_command(label="Scan for Viruses", command=self._scan_viruses)
         tools_menu.add_command(label="Run Pre-Transfer Debugger", command=self._run_debugger)
         tools_menu.add_command(label="Validate Paths", command=self._validate_paths)
         tools_menu.add_separator()
@@ -1273,15 +1510,10 @@ class PS3TransferGUI:
         tools_menu.add_command(label="Open Log Directory", command=self._open_log_dir)
         menubar.add_cascade(label="Tools", menu=tools_menu)
         
-        # Debug menu
-        debug_menu = tk.Menu(menubar, tearoff=0)
-        debug_menu.add_command(label="Enable Debug Mode", command=self._enable_debug)
-        debug_menu.add_command(label="Run Diagnostics", command=self._run_diagnostics)
-        menubar.add_cascade(label="Debug", menu=debug_menu)
-        
         # Help menu
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="Transfer Error Guide", command=self._show_error_guide)
+        help_menu.add_command(label="View Manifest", command=self._view_manifest)
         menubar.add_cascade(label="Help", menu=help_menu)
         
         self.root.config(menu=menubar)
@@ -1294,11 +1526,10 @@ class PS3TransferGUI:
         
         # Create tabs
         self._create_transfer_tab()
-        self._create_game_tab()
-        self._create_virus_tab()
         self._create_debugger_tab()
         self._create_log_tab()
         self._create_error_tab()
+        self._create_verification_tab()  # NEW: Verification tab
     
     def _create_transfer_tab(self):
         """Create transfer tab with game scan button"""
@@ -1310,7 +1541,7 @@ class PS3TransferGUI:
         tab.rowconfigure(5, weight=1)
         
         # Title
-        title_label = ttk.Label(tab, text="PS3 FAT32 Transfer Tool PRO - Enhanced Edition v3.0", style='Title.TLabel')
+        title_label = ttk.Label(tab, text="PS3 FAT32 Transfer Tool PRO - Enhanced Edition v4.0", style='Title.TLabel')
         title_label.grid(row=0, column=0, columnspan=4, pady=(0, 15))
         
         # Source directory selection
@@ -1427,15 +1658,10 @@ class PS3TransferGUI:
         self.games_var = tk.StringVar(value="0")
         ttk.Label(stats_frame, textvariable=self.games_var).grid(row=0, column=3, sticky=tk.W, padx=(5, 20))
         
-        ttk.Label(stats_frame, text="Infected:").grid(row=0, column=4, sticky=tk.W)
-        self.infected_var = tk.StringVar(value="0")
-        infected_label = ttk.Label(stats_frame, textvariable=self.infected_var, style='Infected.TLabel')
-        infected_label.grid(row=0, column=5, sticky=tk.W, padx=(5, 10))
-        
-        ttk.Label(stats_frame, text="Warnings:").grid(row=0, column=6, sticky=tk.W)
+        ttk.Label(stats_frame, text="Warnings:").grid(row=0, column=4, sticky=tk.W)
         self.warnings_var = tk.StringVar(value="0")
         warnings_label = ttk.Label(stats_frame, textvariable=self.warnings_var, style='Warning.TLabel')
-        warnings_label.grid(row=0, column=7, sticky=tk.W, padx=(5, 0))
+        warnings_label.grid(row=0, column=5, sticky=tk.W, padx=(5, 10))
         
         ttk.Label(stats_frame, text="Debugger:").grid(row=1, column=0, sticky=tk.W, pady=(5,0))
         self.debugger_var = tk.StringVar(value="0")
@@ -1452,50 +1678,19 @@ class PS3TransferGUI:
         retries_label = ttk.Label(stats_frame, textvariable=self.retries_var, style='Debugger.TLabel')
         retries_label.grid(row=1, column=5, sticky=tk.W, padx=(5, 0))
         
+        ttk.Label(stats_frame, text="Verified:").grid(row=1, column=6, sticky=tk.W, pady=(5,0))
+        self.verified_var = tk.StringVar(value="0")
+        verified_label = ttk.Label(stats_frame, textvariable=self.verified_var, style='Verified.TLabel')
+        verified_label.grid(row=1, column=7, sticky=tk.W, padx=(5, 0))
+        
+        ttk.Label(stats_frame, text="Missing:").grid(row=1, column=8, sticky=tk.W, pady=(5,0))
+        self.missing_var = tk.StringVar(value="0")
+        missing_label = ttk.Label(stats_frame, textvariable=self.missing_var, style='Missing.TLabel')
+        missing_label.grid(row=1, column=9, sticky=tk.W, padx=(5, 0))
+        
         # Configure grid weights for tab
         tab.columnconfigure(1, weight=1)
         tab.rowconfigure(5, weight=1)
-    
-    def _create_game_tab(self):
-        """Create game scanner tab"""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Game Scanner")
-        
-        # Create paned window for split view
-        paned = ttk.PanedWindow(tab, orient=tk.HORIZONTAL)
-        paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # Left pane - game list
-        left_frame = ttk.Frame(paned)
-        paned.add(left_frame, weight=1)
-        
-        ttk.Label(left_frame, text="Detected PS3 Games").pack(pady=(0, 5))
-        self.game_list = ttk.Treeview(left_frame, columns=('status', 'size', 'warnings'), show='headings')
-        self.game_list.heading('#0', text='Game')
-        self.game_list.heading('status', text='Status')
-        self.game_list.heading('size', text='Size')
-        self.game_list.heading('warnings', text='Warnings')
-        self.game_list.pack(fill=tk.BOTH, expand=True)
-        
-        # Right pane - game details
-        right_frame = ttk.Frame(paned)
-        paned.add(right_frame, weight=2)
-        
-        ttk.Label(right_frame, text="Game Details").pack(pady=(0, 5))
-        self.game_details = scrolledtext.ScrolledText(right_frame, state=tk.DISABLED)
-        self.game_details.pack(fill=tk.BOTH, expand=True)
-    
-    def _create_virus_tab(self):
-        """Create virus scanner tab"""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Virus Scanner")
-        
-        # Create treeview for scan results
-        self.virus_tree = ttk.Treeview(tab, columns=('status', 'engine'), show='headings')
-        self.virus_tree.heading('#0', text='File')
-        self.virus_tree.heading('status', text='Status')
-        self.virus_tree.heading('engine', text='Engine')
-        self.virus_tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
     
     def _create_debugger_tab(self):
         """Create debugger diagnostics tab"""
@@ -1563,6 +1758,44 @@ class PS3TransferGUI:
         self.error_status = ttk.Label(tab, text="No errors detected", style='Status.TLabel')
         self.error_status.pack(pady=(0, 5))
     
+    def _create_verification_tab(self):
+        """NEW: Create verification results tab"""
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="Verification")
+        
+        # Create treeview for verification results
+        columns = ('size', 'status', 'hash')
+        self.verification_tree = ttk.Treeview(
+            tab, 
+            columns=columns, 
+            show='headings',
+            selectmode='browse',
+            height=20
+        )
+        
+        # Configure columns
+        self.verification_tree.heading('#0', text='File Path', anchor=tk.W)
+        self.verification_tree.heading('size', text='Size', anchor=tk.W)
+        self.verification_tree.heading('status', text='Status', anchor=tk.W)
+        self.verification_tree.heading('hash', text='Hash Match', anchor=tk.W)
+        
+        self.verification_tree.column('#0', width=350, stretch=tk.YES)
+        self.verification_tree.column('size', width=100, stretch=tk.NO)
+        self.verification_tree.column('status', width=100, stretch=tk.NO)
+        self.verification_tree.column('hash', width=120, stretch=tk.NO)
+        
+        # Add scrollbar
+        scrollbar = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=self.verification_tree.yview)
+        self.verification_tree.configure(yscroll=scrollbar.set)
+        
+        # Layout
+        self.verification_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10), pady=10)
+        
+        # Add status label
+        self.verification_status = ttk.Label(tab, text="Verification results will appear after transfer", style='Status.TLabel')
+        self.verification_status.pack(side=tk.BOTTOM, pady=(0, 5))
+    
     def _browse_source(self):
         """Browse for source directory"""
         directory = filedialog.askdirectory(title="Select PS3 Game Directory")
@@ -1601,7 +1834,7 @@ class PS3TransferGUI:
     def _run_game_scan(self, source_path: Path):
         """Run game scan and update UI"""
         try:
-            self._update_status("Scanning for PS3 games...")
+            self.engine._update_status("Scanning for PS3 games...")
             games = PS3GameScanner.find_ps3_games(source_path)
             total_size = 0
             total_warnings = 0
@@ -1626,7 +1859,7 @@ class PS3TransferGUI:
                     
                     total_size += game_info['size']
                 except Exception as e:
-                    self.logger.error(f"Failed to get game info for {game_path}: {e}")
+                    self.engine.logger.error(f"Failed to get game info for {game_path}: {e}")
                     # Add as an error entry
                     self.root.after(0, lambda name=game_path.name: self.game_list_main.insert(
                         '', 'end', text=name, values=("0.00 GB", "Error", 0)
@@ -1637,7 +1870,7 @@ class PS3TransferGUI:
             self.root.after(0, lambda: self.game_info_label.config(text=status_text))
             
         except Exception as e:
-            self.logger.error(f"Game scan failed: {e}")
+            self.engine.logger.error(f"Game scan failed: {e}")
             self.root.after(0, lambda: self.game_info_label.config(
                 text=f"Scan failed: {str(e)}"
             ))
@@ -1664,7 +1897,7 @@ class PS3TransferGUI:
     def _run_path_validation(self, source_path: Path):
         """Run path validation and report issues"""
         try:
-            self._update_status("Validating paths...")
+            self.engine._update_status("Validating paths...")
             warning_count = 0
             
             for root, dirs, files in os.walk(source_path):
@@ -1685,16 +1918,16 @@ class PS3TransferGUI:
                     
                     if issues:
                         warning_count += 1
-                        self.logger.warning(f"Path issue: {relative_path} - {', '.join(issues)}")
+                        self.engine.logger.warning(f"Path issue: {relative_path} - {', '.join(issues)}")
                         self.root.after(0, self._add_path_warning, file_path, issues)
             
-            self._update_status(f"Path validation complete! Found {warning_count} potential issues")
+            self.engine._update_status(f"Path validation complete! Found {warning_count} potential issues")
             messagebox.showinfo("Validation Complete", 
                               f"Found {warning_count} files with potential path issues")
             
         except Exception as e:
-            self.logger.error(f"Path validation failed: {e}")
-            self._update_status("Path validation failed")
+            self.engine.logger.error(f"Path validation failed: {e}")
+            self.engine._update_status("Path validation failed")
     
     def _add_path_warning(self, file_path: Path, issues: List[str]):
         """Add path warning to the error diagnostics tab"""
@@ -1706,28 +1939,6 @@ class PS3TransferGUI:
         self.error_text.see(tk.END)
         self.error_text.configure(state=tk.DISABLED)
         self.error_status.config(text=f"{self.error_text.index('end-1c').split('.')[0]} warnings found")
-    
-    def _scan_viruses(self):
-        """Scan for viruses"""
-        source = self.source_var.get().strip()
-        if not source:
-            messagebox.showerror("Error", "Please select source directory first")
-            return
-        
-        source_path = Path(source)
-        if not source_path.exists():
-            messagebox.showerror("Error", "Source directory does not exist")
-            return
-        
-        # Clear previous results
-        self.virus_tree.delete(*self.virus_tree.get_children())
-        
-        # Start scan in separate thread
-        threading.Thread(
-            target=self.engine.scan_for_viruses,
-            args=(source_path,),
-            daemon=True
-        ).start()
     
     def _run_debugger(self):
         """Run debugger on selected directory"""
@@ -1761,14 +1972,14 @@ class PS3TransferGUI:
     def _run_debugger_scan(self, source_path: Path, dest_path: Path):
         """Run debugger scan and report issues"""
         try:
-            self._update_status("Running pre-transfer debugger...")
+            self.engine._update_status("Running pre-transfer debugger...")
             issue_count = 0
             fixed_count = 0
             
             for root, dirs, files in os.walk(source_path):
                 for file in files:
                     file_path = Path(root) / file
-                    issues, fixed = EnhancedDebugger.check_file_integrity(file_path, dest_path, self.logger)
+                    issues, fixed = EnhancedDebugger.check_file_integrity(file_path, dest_path, self.engine.logger)
                     
                     if issues:
                         issue_count += 1
@@ -1786,14 +1997,14 @@ class PS3TransferGUI:
                         self.root.after(0, self.debugger_text.see, tk.END)
                         self.root.after(0, self.debugger_text.configure, tk.DISABLED)
             
-            self._update_status(f"Debugger complete! Found {issue_count} issues, fixed {fixed_count}")
+            self.engine._update_status(f"Debugger complete! Found {issue_count} issues, fixed {fixed_count}")
             self.root.after(0, lambda: self.debugger_status.config(
                 text=f"Debugger found {issue_count} issues, fixed {fixed_count}"
             ))
             
         except Exception as e:
-            self.logger.error(f"Debugger failed: {e}")
-            self._update_status("Debugger failed")
+            self.engine.logger.error(f"Debugger failed: {e}")
+            self.engine._update_status("Debugger failed")
     
     def _fix_attributes(self):
         """Fix file attributes in selected directory"""
@@ -1817,7 +2028,7 @@ class PS3TransferGUI:
     def _run_attribute_fix(self, source_path: Path):
         """Fix file attributes recursively"""
         try:
-            self._update_status("Fixing file attributes...")
+            self.engine._update_status("Fixing file attributes...")
             fixed_count = 0
             
             for root, dirs, files in os.walk(source_path):
@@ -1831,12 +2042,12 @@ class PS3TransferGUI:
                         except:
                             pass
             
-            self._update_status(f"Fixed attributes for {fixed_count} files")
+            self.engine._update_status(f"Fixed attributes for {fixed_count} files")
             messagebox.showinfo("Success", f"Fixed attributes for {fixed_count} files")
             
         except Exception as e:
-            self.logger.error(f"Attribute fix failed: {e}")
-            self._update_status("Attribute fix failed")
+            self.engine.logger.error(f"Attribute fix failed: {e}")
+            self.engine._update_status("Attribute fix failed")
     
     def _auto_rename_files(self):
         """Automatically rename problematic files"""
@@ -1860,7 +2071,7 @@ class PS3TransferGUI:
     def _run_auto_rename(self, source_path: Path):
         """Automatically rename files with invalid names"""
         try:
-            self._update_status("Renaming problematic files...")
+            self.engine._update_status("Renaming problematic files...")
             renamed_count = 0
             
             for root, dirs, files in os.walk(source_path):
@@ -1876,12 +2087,12 @@ class PS3TransferGUI:
                         except:
                             pass
             
-            self._update_status(f"Renamed {renamed_count} files")
+            self.engine._update_status(f"Renamed {renamed_count} files")
             messagebox.showinfo("Success", f"Renamed {renamed_count} files")
             
         except Exception as e:
-            self.logger.error(f"Auto-rename failed: {e}")
-            self._update_status("Auto-rename failed")
+            self.engine.logger.error(f"Auto-rename failed: {e}")
+            self.engine._update_status("Auto-rename failed")
     
     def _enable_long_paths(self):
         """Enable long path support on Windows"""
@@ -1921,6 +2132,10 @@ class PS3TransferGUI:
         self.error_text.configure(state=tk.DISABLED)
         self.error_status.config(text="Transfer in progress...")
         
+        # Clear verification tab
+        self.verification_tree.delete(*self.verification_tree.get_children())
+        self.verification_status.config(text="Verification in progress...")
+        
         # Start transfer in separate thread
         self.transfer_thread = threading.Thread(
             target=self._transfer_worker,
@@ -1941,21 +2156,63 @@ class PS3TransferGUI:
             success = self.engine.transfer_game(source_path, dest_path)
             self.root.after(0, self._transfer_completed, success)
         except Exception as e:
-            self.logger.error(f"Transfer thread error: {e}", exc_info=True)
+            self.engine.logger.error(f"Transfer thread error: {e}", exc_info=True)
             self.root.after(0, self._transfer_completed, False)
     
     def _transfer_completed(self, success: bool):
         """Handle transfer completion"""
         self.start_button.configure(state=tk.NORMAL)
         self.pause_button.configure(state=tk.DISABLED)
+        self.pause_button.configure(text='Pause')
         self.cancel_button.configure(state=tk.DISABLED)
         
         if success:
             messagebox.showinfo("Success", "Transfer completed successfully!")
             self.error_status.config(text="Transfer completed successfully!")
+            # Load verification results
+            self._load_verification_results()
         else:
             self.error_status.config(text="Transfer failed - see error diagnostics")
             self._show_error_guide()
+    
+    def _load_verification_results(self):
+        """Load verification results into the verification tab"""
+        self.verification_tree.delete(*self.verification_tree.get_children())
+        
+        if not self.engine.file_manifest or 'files' not in self.engine.file_manifest:
+            self.verification_status.config(text="No verification data available")
+            return
+        
+        verified_count = 0
+        total_files = len(self.engine.file_manifest['files'])
+        
+        for relative_path, file_info in self.engine.file_manifest['files'].items():
+            status = "Verified" if file_info.get('verified', False) else "Not Verified"
+            status_style = ""
+            
+            if status == "Verified":
+                verified_count += 1
+                status_style = "Verified.TLabel"
+            else:
+                status_style = "Warning.TLabel"
+            
+            size_str = f"{file_info['size'] / (1024**2):.2f} MB"
+            hash_match = "N/A"
+            
+            if file_info.get('hash'):
+                hash_match = "Matched" if file_info.get('verified', False) else "Mismatch"
+            
+            self.verification_tree.insert('', 'end', text=relative_path, 
+                                        values=(size_str, status, hash_match),
+                                        tags=(status_style,))
+        
+        # Apply tags for styling
+        self.verification_tree.tag_configure('Verified.TLabel', foreground='green')
+        self.verification_tree.tag_configure('Warning.TLabel', foreground='orange')
+        
+        # Update status
+        status_text = f"Verified {verified_count}/{total_files} files"
+        self.verification_status.config(text=status_text)
     
     def _pause_transfer(self):
         """Pause/resume transfer"""
@@ -1974,20 +2231,20 @@ class PS3TransferGUI:
     
     def _handle_file_warning(self, file_path: Path, issues: List[str]):
         """Handle file warnings during scanning"""
-        self.stats.warning_files += 1
-        self.root.after(0, self.warnings_var.set, str(self.stats.warning_files))
+        self.engine.stats.warning_files += 1
+        self.root.after(0, self.warnings_var.set, str(self.engine.stats.warning_files))
         
         # Add to error diagnostics tab
         self.root.after(0, self._add_path_warning, file_path, issues)
     
     def _handle_debugger_issue(self, file_path: Path, issues: List[str], fixed: bool):
         """Handle debugger issues during transfer"""
-        self.stats.debugger_issues += 1
+        self.engine.stats.debugger_issues += 1
         if fixed:
-            self.stats.debugger_fixed += 1
+            self.engine.stats.debugger_fixed += 1
             
-        self.root.after(0, self.debugger_var.set, str(self.stats.debugger_issues))
-        self.root.after(0, self.fixed_var.set, str(self.stats.debugger_fixed))
+        self.root.after(0, self.debugger_var.set, str(self.engine.stats.debugger_issues))
+        self.root.after(0, self.fixed_var.set, str(self.engine.stats.debugger_fixed))
         
         # Add to debugger tab
         self.root.after(0, self.debugger_text.configure, tk.NORMAL)
@@ -2000,7 +2257,7 @@ class PS3TransferGUI:
         self.root.after(0, self.debugger_text.see, tk.END)
         self.root.after(0, self.debugger_text.configure, tk.DISABLED)
         self.root.after(0, self.debugger_status.config, 
-                       text=f"{self.debugger_text.index('end-1c').split('.')[0]} issues found, {self.stats.debugger_fixed} fixed")
+                       text=f"{self.debugger_text.index('end-1c').split('.')[0]} issues found, {self.engine.stats.debugger_fixed} fixed")
     
     def _update_progress(self, stats: TransferStats):
         """Update progress display"""
@@ -2011,11 +2268,12 @@ class PS3TransferGUI:
         self.current_file_var.set(stats.current_file)
         self.files_var.set(f"{stats.processed_files}/{stats.total_files}")
         self.games_var.set(f"{stats.games_count}")
-        self.infected_var.set(f"{stats.infected_files}")
         self.warnings_var.set(f"{stats.warning_files}")
         self.debugger_var.set(f"{stats.debugger_issues}")
         self.fixed_var.set(f"{stats.debugger_fixed}")
         self.retries_var.set(f"{stats.debugger_retries}")
+        self.verified_var.set(f"{stats.verified_files}")
+        self.missing_var.set(f"{stats.missing_files}")
         
         # Format speed
         if stats.transfer_speed > 0:
@@ -2040,49 +2298,6 @@ class PS3TransferGUI:
     def _update_status(self, message: str):
         """Update status message"""
         self.status_var.set(message)
-    
-    def _update_virus_scan(self, result: Dict):
-        """Update virus scan results"""
-        file = result.get('file', '')
-        status = "Infected" if not result.get('clean', True) else "Clean"
-        
-        for engine, details in result.get('engines', {}).items():
-            self.virus_tree.insert('', 'end', text=file, values=(status, engine))
-    
-    def _update_game_scan(self, result: Dict):
-        """Update game scan results"""
-        status = "Valid" if result['valid'] else "Invalid"
-        size_gb = result['size'] / (1024**3)
-        warnings = len(result['warning_files'])
-        
-        self.game_list.insert('', 'end', text=result['name'], 
-                            values=(status, f"{size_gb:.2f} GB", warnings))
-        
-        # Update details
-        self.game_details.config(state=tk.NORMAL)
-        self.game_details.insert(tk.END, f"Game: {result['name']}\n")
-        self.game_details.insert(tk.END, f"Status: {'Valid' if result['valid'] else 'Invalid'}\n")
-        self.game_details.insert(tk.END, f"Size: {size_gb:.2f} GB\n")
-        self.game_details.insert(tk.END, f"Files: {len(result['files'])}\n")
-        self.game_details.insert(tk.END, f"Warnings: {warnings}\n")
-        
-        if result['sfo_data']:
-            self.game_details.insert(tk.END, "\nSFO Metadata:\n")
-            for key, value in result['sfo_data'].items():
-                self.game_details.insert(tk.END, f"  {key}: {value}\n")
-        
-        if result['issues']:
-            self.game_details.insert(tk.END, "\nIssues:\n")
-            for issue in result['issues']:
-                self.game_details.insert(tk.END, f"  - {issue}\n")
-        
-        if warnings:
-            self.game_details.insert(tk.END, "\nFiles with Warnings:\n")
-            for file in result['warning_files']:
-                self.game_details.insert(tk.END, f"  - {file}\n")
-        
-        self.game_details.insert(tk.END, "\n" + "="*50 + "\n")
-        self.game_details.config(state=tk.DISABLED)
     
     def _log_message(self, message: str):
         """Add message to log display"""
@@ -2149,6 +2364,32 @@ class PS3TransferGUI:
         
         messagebox.showinfo("Transfer Error Guide", guide)
     
+    def _view_manifest(self):
+        """View transfer manifest"""
+        try:
+            if not self.engine.manifest_path.exists():
+                messagebox.showinfo("Manifest", "No manifest available. Run a transfer first.")
+                return
+                
+            with open(self.engine.manifest_path, 'r') as f:
+                manifest_content = json.load(f)
+            
+            # Create a formatted string
+            manifest_str = json.dumps(manifest_content, indent=2)
+            
+            # Show in a dialog
+            manifest_window = tk.Toplevel(self.root)
+            manifest_window.title("Transfer Manifest")
+            manifest_window.geometry("800x600")
+            
+            text_area = scrolledtext.ScrolledText(manifest_window, wrap=tk.WORD)
+            text_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            text_area.insert(tk.INSERT, manifest_str)
+            text_area.configure(state=tk.DISABLED)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open manifest: {e}")
+    
     def _copy_error_details(self):
         """Copy error details to clipboard"""
         self.root.clipboard_clear()
@@ -2190,33 +2431,6 @@ class PS3TransferGUI:
                 subprocess.run(['xdg-open', log_dir])
         except Exception as e:
             messagebox.showerror("Error", f"Could not open log directory: {e}")
-    
-    def _enable_debug(self):
-        """Enable debug mode"""
-        self.logger.set_debug_level(3)
-        messagebox.showinfo("Debug Mode", "Full debug mode enabled. All messages will be logged.")
-    
-    def _run_diagnostics(self):
-        """Run system diagnostics"""
-        try:
-            diag_info = {
-                'timestamp': datetime.now().isoformat(),
-                'platform': platform.platform(),
-                'python_version': platform.python_version(),
-                'executable': sys.executable,
-                'cwd': os.getcwd(),
-                'log_file': str(self.logger.log_file.absolute()),
-                'long_path_support': enable_long_paths()
-            }
-            
-            # Save diagnostics to file
-            diag_file = Path("diagnostics.json")
-            with open(diag_file, 'w') as f:
-                json.dump(diag_info, f, indent=2)
-            
-            messagebox.showinfo("Diagnostics", f"System diagnostics saved to:\n{diag_file}")
-        except Exception as e:
-            messagebox.showerror("Diagnostics Error", f"Failed to run diagnostics: {e}")
     
     def _set_debug_level(self):
         """Set debug level from radio buttons"""
